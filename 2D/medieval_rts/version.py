@@ -1,5 +1,5 @@
 APP_NAME = "MedievalKingdomsRTS"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 VERSION_TAG = f"v{VERSION}"
 
 GITHUB_OWNER = "LordEpasus"
@@ -12,3 +12,4 @@ GAME_RUNTIME_DIR = "runtime"
 
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+GITHUB_TAG_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/{{tag}}"

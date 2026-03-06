@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -142,11 +143,84 @@ def make_zip_from_dist(project_root: Path, package_dir: Path, app_name: str) -> 
     return Path(zip_path)
 
 
+def find_iscc() -> Path | None:
+    candidates = [
+        shutil.which("iscc"),
+        shutil.which("ISCC"),
+        r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        r"C:\Program Files\Inno Setup 6\ISCC.exe",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
+def write_inno_script(project_root: Path, package_dir: Path, app_name: str, icon_path: Path | None) -> Path:
+    build_dir = project_root / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    script_path = build_dir / "windows_installer.iss"
+    icon_line = f'SetupIconFile={icon_path.as_posix()}' if icon_path is not None else ""
+    script = textwrap.dedent(
+        f"""\
+        [Setup]
+        AppId=LordEpasus.MedievalKingdomsRTS
+        AppName={app_name}
+        AppVersion={VERSION}
+        AppPublisher=LordEpasus
+        DefaultDirName={{localappdata}}\\Programs\\{app_name}
+        DefaultGroupName={app_name}
+        DisableProgramGroupPage=yes
+        UninstallDisplayIcon={{app}}\\{app_name}.exe
+        OutputDir={ (project_root / "release").as_posix() }
+        OutputBaseFilename={app_name}-Setup
+        ArchitecturesAllowed=x64compatible
+        ArchitecturesInstallIn64BitMode=x64compatible
+        PrivilegesRequired=lowest
+        Compression=lzma
+        SolidCompression=yes
+        WizardStyle=modern
+        {icon_line}
+
+        [Tasks]
+        Name: "desktopicon"; Description: "Masaustu kisayolu olustur"; Flags: unchecked
+
+        [Files]
+        Source: "{package_dir.as_posix()}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+        [Icons]
+        Name: "{{autoprograms}}\\{app_name}"; Filename: "{{app}}\\{app_name}.exe"
+        Name: "{{autodesktop}}\\{app_name}"; Filename: "{{app}}\\{app_name}.exe"; Tasks: desktopicon
+
+        [Run]
+        Filename: "{{app}}\\{app_name}.exe"; Description: "Oyunu baslat"; Flags: nowait postinstall skipifsilent
+        """
+    )
+    script_path.write_text(script, encoding="utf-8")
+    return script_path
+
+
+def build_windows_installer(project_root: Path, package_dir: Path, app_name: str, icon_path: Path | None) -> Path:
+    iscc = find_iscc()
+    if iscc is None:
+        raise SystemExit("Inno Setup (ISCC.exe) bulunamadi. --installer icin once Inno Setup kurulu olmali.")
+    script_path = write_inno_script(project_root, package_dir, app_name, icon_path)
+    run([str(iscc), str(script_path)], cwd=project_root)
+    installer_path = project_root / "release" / f"{app_name}-Setup.exe"
+    if not installer_path.exists():
+        raise SystemExit(f"installer olusmadi: {installer_path}")
+    return installer_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build Windows exe with PyInstaller for Medieval RTS")
     parser.add_argument("--project", default=str(Path(__file__).resolve().parents[1]), help="medieval_rts project root")
     parser.add_argument("--name", default=APP_NAME, help="App name")
     parser.add_argument("--clean", action="store_true", help="Delete build/dist before build")
+    parser.add_argument("--installer", action="store_true", help="Build Windows setup installer with Inno Setup")
     args = parser.parse_args()
 
     project_root = Path(args.project).resolve()
@@ -163,7 +237,12 @@ def main() -> int:
     build_launcher(project_root, app_name, icon_path)
     package_dir = assemble_release_layout(project_root, app_name)
     zip_path = make_zip_from_dist(project_root, package_dir, app_name)
+    installer_path = None
+    if args.installer:
+        installer_path = build_windows_installer(project_root, package_dir, app_name, icon_path)
     print(f"[done] release zip: {zip_path}")
+    if installer_path is not None:
+        print(f"[done] release installer: {installer_path}")
     return 0
 
 

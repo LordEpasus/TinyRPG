@@ -7,7 +7,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from version import APP_NAME, GITHUB_LATEST_RELEASE_API
+from version import APP_NAME, GITHUB_LATEST_RELEASE_API, GITHUB_TAG_RELEASE_API
 
 
 class UpdaterError(RuntimeError):
@@ -44,9 +44,9 @@ def has_newer_version(current_version: str, latest_version: str) -> bool:
     return _version_tuple(latest_version) > _version_tuple(current_version)
 
 
-def fetch_latest_release(timeout: float = 6.0) -> ReleaseInfo | None:
+def _fetch_release(api_url: str, timeout: float = 6.0) -> ReleaseInfo | None:
     req = urllib.request.Request(
-        GITHUB_LATEST_RELEASE_API,
+        api_url,
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": f"{APP_NAME}-launcher",
@@ -78,6 +78,17 @@ def fetch_latest_release(timeout: float = 6.0) -> ReleaseInfo | None:
         published_at=str(payload.get("published_at", "")).strip(),
         assets=tuple(assets),
     )
+
+
+def fetch_latest_release(timeout: float = 6.0) -> ReleaseInfo | None:
+    return _fetch_release(GITHUB_LATEST_RELEASE_API, timeout=timeout)
+
+
+def fetch_release_by_tag(tag: str, timeout: float = 6.0) -> ReleaseInfo | None:
+    clean = str(tag).strip()
+    if not clean:
+        return None
+    return _fetch_release(GITHUB_TAG_RELEASE_API.format(tag=clean), timeout=timeout)
 
 
 def find_release_asset(release: ReleaseInfo, asset_name: str) -> ReleaseAsset | None:

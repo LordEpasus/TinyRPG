@@ -2972,10 +2972,14 @@ class Game:
                 delta -= (CAPITAL_FOOD_MIN_DAYS - food_days) * 0.58
             else:
                 delta += 0.12
+                if food_days > CAPITAL_FOOD_MIN_DAYS + 2.0:
+                    delta += 0.06
             if gold_days < CAPITAL_GOLD_MIN_DAYS:
                 delta -= (CAPITAL_GOLD_MIN_DAYS - gold_days) * 0.46
             else:
                 delta += 0.10
+                if gold_days > CAPITAL_GOLD_MIN_DAYS + 2.0:
+                    delta += 0.05
             delta -= frontier_units * 0.02
 
             civ.stability = max(0.0, min(100.0, civ.stability + delta))
@@ -2987,6 +2991,9 @@ class Game:
                 self._apply_desertion_pressure(civ, severe=civ.stability < MUTINY_STABILITY_THRESHOLD)
             if (
                 civ.stability < MUTINY_STABILITY_THRESHOLD
+                and civ.loyalty < 34.0
+                and civ.upkeep_pressure > 1.4
+                and (food_days < max(1.4, CAPITAL_FOOD_MIN_DAYS * 0.55) or gold_days < max(1.2, CAPITAL_GOLD_MIN_DAYS * 0.55))
                 and civ.split_cooldown <= 0.0
                 and len(self._active_civilized_kingdom_ids()) < MAX_ACTIVE_KINGDOMS
             ):

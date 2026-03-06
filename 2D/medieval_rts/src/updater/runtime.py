@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,20 @@ def launch_game_process() -> subprocess.Popen[bytes]:
     if is_frozen_build():
         return subprocess.Popen([str(game_path)], cwd=str(game_path.parent))
     return subprocess.Popen([sys.executable, str(game_path)], cwd=str(game_path.parent))
+
+
+def apply_portable_update(staged_root: Path, destination_root: Path) -> None:
+    destination_root.mkdir(parents=True, exist_ok=True)
+    for source in staged_root.iterdir():
+        target = destination_root / source.name
+        if source.is_dir():
+            if target.exists() and not target.is_dir():
+                target.unlink()
+            shutil.copytree(source, target, dirs_exist_ok=True)
+            continue
+        if target.exists() and target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        shutil.copy2(source, target)
 
 
 def schedule_windows_update(staged_root: Path, destination_root: Path, *, cleanup_root: Path | None = None) -> Path:

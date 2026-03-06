@@ -268,6 +268,7 @@ class AIController:
     def _plan_state(self) -> None:
         civ = self.game._kingdom(self.civilization)
         food_days, gold_days = self._capital_stock_days(civ)
+        reserve_ratio = self._reserve_ratio(civ)
         threat = self._threat_level_near_base()
         scores = {
             self.STATE_EXPAND: 1.8,
@@ -279,6 +280,14 @@ class AIController:
         }
 
         scores[self.STATE_GATHER] += max(0.0, 3.0 - min(food_days, gold_days)) * 0.55
+        if reserve_ratio < 1.0:
+            shortage = 1.0 - reserve_ratio
+            scores[self.STATE_GATHER] += 2.8 + shortage * 3.2
+            scores[self.STATE_STABILIZE] += 1.9 + shortage * 2.4
+            scores[self.STATE_ATTACK] -= 1.6 + shortage * 3.5
+        elif reserve_ratio > 1.28:
+            scores[self.STATE_EXPAND] += 0.55
+            scores[self.STATE_ATTACK] += 0.65
         if food_days < 3.5 or gold_days < 3.0:
             scores[self.STATE_STABILIZE] += 4.4
         if civ.stability < 55.0:
@@ -287,8 +296,10 @@ class AIController:
             scores[self.STATE_CIVIL_WAR_RESPONSE] += 4.8 + max(0.0, 42.0 - civ.loyalty) * 0.05
         if threat > 0:
             scores[self.STATE_STABILIZE] += threat * 0.35
+            if reserve_ratio < 1.1:
+                scores[self.STATE_STABILIZE] += 0.8
         if self._needs_naval_logistics():
-            scores[self.STATE_NAVAL_LOGISTICS] += 3.2
+            scores[self.STATE_NAVAL_LOGISTICS] += 3.2 if reserve_ratio >= 0.92 else 1.1
         if self._can_launch_attack():
             scores[self.STATE_ATTACK] += 2.8 + min(2.2, self._combat_count() * 0.18)
             if food_days >= 4.0 and gold_days >= 4.0:
@@ -309,11 +320,7 @@ class AIController:
             return
         self._attack_order_timer_s = 0.62
 
-        attackers = [
-            u
-            for u in self.game.units
-            if u.kingdom_id == self.civilization and not u.is_dead and u.can_attack and not u.can_gather
-        ]
+        attackers = self._attack_group_units()
         if len(attackers) < 4:
             self._force_state(self.STATE_GATHER)
             return
@@ -464,11 +471,17 @@ class AIController:
             return False
         civ = self.game._kingdom(self.civilization)
         food_days, gold_days = self._capital_stock_days(civ)
+        reserve_ratio = self._reserve_ratio(civ)
         if civ.stability < 48.0 or civ.loyalty < 45.0:
             return False
         if food_days < 2.6 or gold_days < 2.2:
             return False
-        if self._combat_count() < 5:
+        combat_count = self._combat_count()
+        if reserve_ratio < 1.05:
+            return False
+        if combat_count < 5:
+            return False
+        if combat_count <= self._defender_reserve_target() + 3:
             return False
         has_military = any(
             b.kingdom_id == self.civilization
@@ -477,6 +490,54 @@ class AIController:
             for b in self.game.buildings
         )
         return has_military
+
+    def _reserve_targets(self, civ) -> dict[str, int]:
+        workers = sum(1 for unit in civ.units if (not unit.is_dead and unit.can_gather))
+        combat = sum(1 for unit in civ.units if (not unit.is_dead and unit.can_attack and not unit.can_gather))
+        buildings = sum(1 for building in civ.buildings if not building.is_dead)
+        time_phase = int(self._elapsed_s // 120.0)
+        return {
+            "gold": 420 + combat * 48 + workers * 16 + buildings * 12 + time_phase * 90,
+            "wood": 360 + workers * 18 + buildings * 22 + time_phase * 80,
+            "stone": 240 + buildings * 24 + combat * 8 + time_phase * 50,
+            "food": 220 + combat * 22 + workers * 10 + time_phase * 45,
+        }
+
+    def _reserve_ratio(self, civ) -> float:
+        targets = self._reserve_targets(civ)
+        ratios = []
+        for key, target in targets.items():
+            current = civ.capital_stockpile.get(key, 0)
+            if key == "food":
+                current += civ.capital_stockpile.get("meat", 0)
+            ratios.append(current / max(1, target))
+        return min(ratios) if ratios else 1.0
+
+    def _defender_reserve_target(self) -> int:
+        combat = self._combat_count()
+        if combat <= 0:
+            return 0
+        threat = self._threat_level_near_base()
+        reserve = max(2, threat, combat // 4)
+        return min(reserve, max(0, combat - 3))
+
+    def _attack_group_units(self) -> list[Unit]:
+        combatants = [
+            u
+            for u in self.game.units
+            if u.kingdom_id == self.civilization and not u.is_dead and u.can_attack and not u.can_gather
+        ]
+        if not combatants:
+            return []
+        base_x, base_y = self._capital_world()
+        combatants.sort(
+            key=lambda u: (u.world_pos.x - base_x) ** 2 + (u.world_pos.y - base_y) ** 2,
+            reverse=True,
+        )
+        reserve = self._defender_reserve_target()
+        if reserve <= 0:
+            return combatants
+        return combatants[: max(0, len(combatants) - reserve)]
 
     def _capital_stock_days(self, civ) -> tuple[float, float]:
         combat = sum(1 for unit in civ.units if (not unit.is_dead and unit.can_attack and not unit.can_gather))
@@ -661,11 +722,7 @@ class AIController:
                 )
                 return
             attackers = sorted(
-                [
-                    u
-                    for u in self.game.units
-                    if u.kingdom_id == self.civilization and not u.is_dead and u.can_attack and not u.can_gather
-                ],
+                self._attack_group_units(),
                 key=lambda u: (u.world_pos.x - home_anchor[0]) ** 2 + (u.world_pos.y - home_anchor[1]) ** 2,
             )[: Ship.CAPACITY]
             for attacker in attackers:
@@ -760,6 +817,7 @@ class AIController:
         workers = len(self._workers())
         elapsed = self._elapsed_s
         civ = self.game._kingdom(self.civilization)
+        reserve_ratio = self._reserve_ratio(civ)
         need_naval = self._needs_naval_logistics()
         desired = {
             Building.TYPE_HOUSE1: 2 if workers >= 6 else 1,
@@ -771,6 +829,14 @@ class AIController:
             Building.TYPE_SMITHY: 1 if elapsed > 120 else 0,
             Building.TYPE_CASTLE: 1 if elapsed > 210 else 0,
         }
+        if reserve_ratio < 0.95:
+            desired[Building.TYPE_ARCHERY] = min(desired[Building.TYPE_ARCHERY], 1)
+            desired[Building.TYPE_BARRACKS] = min(desired[Building.TYPE_BARRACKS], 1)
+            desired[Building.TYPE_SMITHY] = 0
+            desired[Building.TYPE_CASTLE] = 0
+        elif reserve_ratio > 1.35:
+            desired[Building.TYPE_HOUSE3] += 1
+            desired[Building.TYPE_TOWER] += int(need_naval)
         if civ.stability < 52.0:
             desired[Building.TYPE_HOUSE1] = max(desired[Building.TYPE_HOUSE1], 2)
             desired[Building.TYPE_HOUSE2] = max(desired[Building.TYPE_HOUSE2], 1)
@@ -795,6 +861,8 @@ class AIController:
             break
 
     def _queue_production(self) -> None:
+        civ = self.game._kingdom(self.civilization)
+        reserve_ratio = self._reserve_ratio(civ)
         producers = [
             b
             for b in self.game.buildings
@@ -806,7 +874,16 @@ class AIController:
         counts = self._unit_counts()
         enemy_counts = self._enemy_unit_counts()
         for building in producers:
+            if (
+                reserve_ratio < 0.88
+                and self.state not in (self.STATE_DEFEND, self.STATE_ATTACK, self.STATE_CIVIL_WAR_RESPONSE)
+                and building.building_type in (Building.TYPE_BARRACKS, Building.TYPE_ARCHERY, Building.TYPE_CASTLE)
+                and self._combat_count() >= max(5, self._defender_reserve_target() + 2)
+            ):
+                continue
             queue_target = building.max_queue - 1 if self.state in (self.STATE_ATTACK, self.STATE_DEFEND) else max(2, building.max_queue - 2)
+            if reserve_ratio < 1.0 and building.building_type in (Building.TYPE_BARRACKS, Building.TYPE_ARCHERY, Building.TYPE_CASTLE):
+                queue_target = min(queue_target, 1)
             while building.queue_size < queue_target:
                 option = self._choose_production_option(building, counts, enemy_counts)
                 if option is None:
@@ -939,21 +1016,24 @@ class AIController:
         return self._resource_priority_list()[0]
 
     def _resource_priority_list(self) -> list[str]:
-        targets = {
-            "gold": 650,
-            "wood": 760,
-            "stone": 600,
-            "food": 200,
-        }
+        targets = self._reserve_targets(self.game._kingdom(self.civilization))
         if not any(
             b.kingdom_id == self.civilization and b.building_type == Building.TYPE_BARRACKS
             for b in self.game.buildings
         ):
             targets["wood"] += 240
             targets["stone"] += 120
+        if self.state in (self.STATE_STABILIZE, self.STATE_CIVIL_WAR_RESPONSE):
+            targets["food"] += 120
+            targets["gold"] += 110
+        if self._needs_naval_logistics():
+            targets["wood"] += 140
+            targets["stone"] += 80
         scored: list[tuple[float, str]] = []
         for key, target in targets.items():
             have = self.resources.get(key, 0)
+            if key == "food":
+                have += self.resources.get("meat", 0)
             score = have / max(1, target)
             scored.append((score, key))
         scored.sort(key=lambda x: x[0])

@@ -46,16 +46,22 @@ Windows tarafinda:
 cd TinyRPG\2D\medieval_rts
 python -m pip install -r requirements.txt
 python -m pip install pyinstaller
-python scripts/build_windows_exe.py --clean
+python scripts/build_windows_exe.py --clean --installer
 ```
 
 Uretilen cikti:
 - `2D/medieval_rts/release/MedievalKingdomsRTS-win64.zip`
+- `2D/medieval_rts/release/MedievalKingdomsRTS-Setup.exe`
 
 Zip icinde:
 - `MedievalKingdomsRTS.exe` -> launcher / auto updater
 - `runtime/` -> asil oyun dosyalari
 - `version.txt` -> paket surumu
+
+Setup paketi:
+- Ilk kurulum icin kullanilir
+- Oyunu `{localappdata}\Programs\MedievalKingdomsRTS` altina kurar
+- Kurulumdan sonra ayni launcher/updater akisi calisir
 
 ### 5) GitHub Release cikar
 
@@ -77,6 +83,21 @@ Workflow dosyasi:
 
 Bu workflow Windows runner acip zip dosyasini otomatik release olarak yukler.
 
+## Updater regresyon testi
+
+Public release paketleriyle tasinabilir guncelleme akisini dogrulamak icin:
+
+```bash
+cd TinyRPG/2D/medieval_rts
+python3 scripts/test_release_updater.py --from-tag v0.1.1 --to-tag v0.1.2
+```
+
+Bu test:
+- GitHub Releases uzerinden iki gercek zip paketini indirir
+- Ilk surumu kurulu gibi acar
+- Ustune yeni surumu uygular
+- `version.txt`, launcher ve runtime duzenini dogrular
+
 ## Arkadaslar nasil gunceller?
 
 ### Gelistirici arkadaslar
@@ -88,8 +109,8 @@ git pull origin main
 ### Oyuncu arkadaslar
 
 - GitHub repo icindeki **Releases** sayfasina girer.
-- Son surum `MedievalKingdomsRTS-win64.zip` dosyasini indirir.
-- Zip'i acip `MedievalKingdomsRTS.exe` dosyasini calistirir.
+- Son surum `MedievalKingdomsRTS-Setup.exe` veya `MedievalKingdomsRTS-win64.zip` dosyasini indirir.
+- Kolay kurulum isterse `Setup.exe`, portable isterse zip kullanir.
 - Launcher acilista GitHub latest release kontrolu yapar.
 - Yeni surum varsa indirip dosyalari gunceller ve oyunu tekrar baslatir.
 

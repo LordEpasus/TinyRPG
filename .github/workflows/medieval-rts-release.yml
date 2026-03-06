@@ -27,20 +27,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r 2D/medieval_rts/requirements.txt
           pip install pyinstaller
+          choco install innosetup -y
 
       - name: Build exe (PyInstaller)
         run: |
-          python 2D/medieval_rts/scripts/build_windows_exe.py --project 2D/medieval_rts --name MedievalKingdomsRTS --clean
+          python 2D/medieval_rts/scripts/build_windows_exe.py --project 2D/medieval_rts --name MedievalKingdomsRTS --clean --installer
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MedievalKingdomsRTS-win64
-          path: 2D/medieval_rts/release/*.zip
+          name: MedievalKingdomsRTS-windows-release
+          path: |
+            2D/medieval_rts/release/*.zip
+            2D/medieval_rts/release/*-Setup.exe
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: 2D/medieval_rts/release/*.zip
+          files: |
+            2D/medieval_rts/release/*.zip
+            2D/medieval_rts/release/*-Setup.exe
           generate_release_notes: true
