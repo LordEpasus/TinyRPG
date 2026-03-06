@@ -1013,9 +1013,9 @@ class AIController:
             )
 
     def _preferred_resource_type(self) -> str:
-        return self._resource_priority_list()[0]
+        return self._resource_priority_list(include_naval_bias=False)[0]
 
-    def _resource_priority_list(self) -> list[str]:
+    def _resource_priority_list(self, *, include_naval_bias: bool = True) -> list[str]:
         targets = self._reserve_targets(self.game._kingdom(self.civilization))
         if not any(
             b.kingdom_id == self.civilization and b.building_type == Building.TYPE_BARRACKS
@@ -1026,7 +1026,7 @@ class AIController:
         if self.state in (self.STATE_STABILIZE, self.STATE_CIVIL_WAR_RESPONSE):
             targets["food"] += 120
             targets["gold"] += 110
-        if self._needs_naval_logistics():
+        if include_naval_bias and self._needs_naval_logistics():
             targets["wood"] += 140
             targets["stone"] += 80
         scored: list[tuple[float, str]] = []
