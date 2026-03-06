@@ -73,6 +73,7 @@ class TileMap:
     ):
         self.cols = MAP_COLS
         self.rows = MAP_ROWS
+        self.seed = int(seed)
         self.spawn_center = spawn_center
         self.spawn_centers = list(spawn_centers or [])
         if spawn_center is not None:
@@ -332,10 +333,10 @@ class TileMap:
                 self._paint_disk(x, y, r, TILE_GRASS, only_on={TILE_WATER, TILE_GRASS})
 
         # Global fill so map is not over-watered on large sizes.
-        for _ in range(max(30, (self.cols * self.rows) // 420)):
+        for _ in range(max(48, (self.cols * self.rows) // 320)):
             x = rng.randint(6, self.cols - 7)
             y = rng.randint(6, self.rows - 7)
-            r = rng.randint(4, 9)
+            r = rng.randint(5, 11)
             self._paint_disk(x, y, r, TILE_GRASS, only_on={TILE_WATER, TILE_GRASS})
 
     def _carve_ocean_channels(self, rng: random.Random) -> None:
@@ -344,7 +345,7 @@ class TileMap:
         mid_row = self.rows // 2
         channel_half = max(1, min(self.cols, self.rows) // 64)
 
-        if rng.random() < 0.5:
+        if rng.random() < 0.42:
             # Vertical sea lane with meander.
             drift = 0
             for row in range(self.rows):
@@ -355,7 +356,7 @@ class TileMap:
                 for col in range(c0 - channel_half, c0 + channel_half + 1):
                     if 0 <= col < self.cols:
                         self.tiles[row][col] = TILE_WATER
-        if rng.random() < 0.35:
+        if rng.random() < 0.22:
             # One horizontal lane, thinner than vertical.
             drift = 0
             for col in range(self.cols):
@@ -500,6 +501,80 @@ class TileMap:
                 if tt == TILE_FOREST:
                     self.forest_tiles.append((col, row))
                     self.forest_cols_by_row[row].append(col)
+
+    def refresh_metadata(self) -> None:
+        self._rebuild_metadata(random.Random(self.seed + 8111))
+
+    def sample_spawn_worlds(
+        self,
+        *,
+        count: int,
+        seed: int,
+        margin: int = 10,
+        min_distance_tiles: int = 28,
+    ) -> list[tuple[float, float]]:
+        rng = random.Random(seed + 13331)
+        candidates: list[tuple[int, int, int]] = []
+        for row in range(max(2, margin), min(self.rows - 2, self.rows - margin)):
+            for col in range(max(2, margin), min(self.cols - 2, self.cols - margin)):
+                if not self.is_walkable(col, row):
+                    continue
+                tile = self.get_tile(col, row)
+                if tile == TILE_WATER:
+                    continue
+                score = self._land_score(col, row, radius=8)
+                if score < 56:
+                    continue
+                candidates.append((score, col, row))
+
+        candidates.sort(key=lambda item: (-item[0], item[2], item[1]))
+        if not candidates:
+            fallback = [
+                self.tile_center(self.cols // 4, self.rows // 4),
+                self.tile_center(self.cols * 3 // 4, self.rows // 4),
+                self.tile_center(self.cols // 4, self.rows * 3 // 4),
+                self.tile_center(self.cols * 3 // 4, self.rows * 3 // 4),
+                self.tile_center(self.cols // 2, self.rows // 2),
+            ]
+            return fallback[: max(1, count)]
+
+        chosen: list[tuple[int, int]] = []
+        radius2 = max(1, min_distance_tiles) * max(1, min_distance_tiles)
+        for _, col, row in candidates:
+            if any((col - cc) * (col - cc) + (row - rr) * (row - rr) < radius2 for cc, rr in chosen):
+                continue
+            chosen.append((col, row))
+            if len(chosen) >= count:
+                break
+
+        pool = [(col, row) for _, col, row in candidates if (col, row) not in chosen]
+        while len(chosen) < count and pool:
+            index = rng.randrange(len(pool))
+            col, row = pool.pop(index)
+            if any((col - cc) * (col - cc) + (row - rr) * (row - rr) < radius2 // 2 for cc, rr in chosen):
+                continue
+            chosen.append((col, row))
+
+        return [self.tile_center(col, row) for col, row in chosen[:count]]
+
+    def apply_spawn_safe_zones(self, spawn_worlds: list[tuple[float, float]]) -> None:
+        self.spawn_centers = list(spawn_worlds)
+        self._apply_spawn_safe_zone()
+        self.refresh_metadata()
+
+    def _land_score(self, col: int, row: int, *, radius: int) -> int:
+        score = 0
+        for nr in range(max(0, row - radius), min(self.rows, row + radius + 1)):
+            for nc in range(max(0, col - radius), min(self.cols, col + radius + 1)):
+                tile = self.tiles[nr][nc]
+                if tile == TILE_WATER:
+                    continue
+                score += 1
+                if tile == TILE_FOREST:
+                    score += 1
+                elif tile == TILE_DIRT:
+                    score += 2
+        return score
 
     # ── Draw: ground ─────────────────────────────────────────────────────────
     def draw(self, screen: pygame.Surface, camera) -> None:

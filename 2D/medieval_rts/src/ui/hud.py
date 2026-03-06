@@ -199,11 +199,15 @@ class GameHUD:
         buildings,
         *,
         player_civilization: str,
+        player_label: str | None = None,
+        color_resolver=None,
     ) -> None:
         map_w = 160
         map_h = 120
         px = screen.get_width() - map_w - 18
         py = screen.get_height() - map_h - 18
+        scale_x = map_w / max(1, self.tilemap.cols)
+        scale_y = map_h / max(1, self.tilemap.rows)
 
         flare_frame = self._scaled_flare("minimap", map_w + 26, map_h + 34)
         if flare_frame is not None:
@@ -223,35 +227,56 @@ class GameHUD:
             mm = pygame.transform.scale(self._minimap_base, (map_w, map_h))
         screen.blit(mm, (px, py))
 
+        def resolve_color(entity, fallback_key: str) -> tuple[int, int, int]:
+            if callable(color_resolver):
+                try:
+                    color = color_resolver(entity)
+                except Exception:
+                    color = None
+                if color is not None:
+                    return tuple(color)
+            return self._CIV_COLORS.get(fallback_key, (220, 220, 220))
+
         # Buildings first, units on top.
         for b in buildings:
             if b.is_dead:
                 continue
             tc, tr = self.tilemap.world_to_tile(b.world_pos.x, b.world_pos.y)
-            if not (0 <= tc < map_w and 0 <= tr < map_h):
+            mx = px + int(tc * scale_x)
+            my = py + int(tr * scale_y)
+            if not (px <= mx < px + map_w and py <= my < py + map_h):
                 continue
-            color = self._CIV_COLORS.get(b.civilization, (220, 220, 220))
-            screen.set_at((px + tc, py + tr), color)
+            color = resolve_color(b, getattr(b, "civilization", ""))
+            screen.set_at((mx, my), color)
 
         for u in units:
             if u.is_dead:
                 continue
             tc, tr = self.tilemap.world_to_tile(u.world_pos.x, u.world_pos.y)
-            if not (0 <= tc < map_w and 0 <= tr < map_h):
+            mx = px + int(tc * scale_x)
+            my = py + int(tr * scale_y)
+            if not (px <= mx < px + map_w and py <= my < py + map_h):
                 continue
-            color = self._CIV_COLORS.get(u.civilization, (250, 250, 250))
-            screen.set_at((px + tc, py + tr), color)
+            color = resolve_color(u, getattr(u, "civilization", ""))
+            screen.set_at((mx, my), color)
 
         # Camera viewport rectangle.
         c0, r0, c1, r1 = camera.get_visible_tile_range()
-        vw = max(1, c1 - c0 + 1)
-        vh = max(1, r1 - r0 + 1)
-        rect = pygame.Rect(px + c0, py + r0, vw, vh)
+        rx = px + int(c0 * scale_x)
+        ry = py + int(r0 * scale_y)
+        vw = max(1, int((c1 - c0 + 1) * scale_x))
+        vh = max(1, int((r1 - r0 + 1) * scale_y))
+        rect = pygame.Rect(rx, ry, vw, vh)
         pygame.draw.rect(screen, (255, 255, 255), rect, 1)
 
         title = self.font_label.render("Mini Harita", True, (236, 240, 246))
         screen.blit(title, (px + 4, py - 20))
-        my_civ = self.font_value.render(player_civilization, True, self._CIV_COLORS.get(player_civilization, (235, 235, 235)))
+        label = player_label or player_civilization
+        civ_color = self._CIV_COLORS.get(
+            player_civilization,
+            self._CIV_COLORS.get(player_civilization.split("_", 1)[0], (235, 235, 235)),
+        )
+        my_civ = self.font_value.render(label, True, civ_color)
         screen.blit(my_civ, (px + map_w - my_civ.get_width(), py - 20))
 
     def draw_endgame(self, screen: pygame.Surface, result: str) -> None:

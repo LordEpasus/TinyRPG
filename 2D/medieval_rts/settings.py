@@ -9,8 +9,10 @@ FULLSCREEN_DEFAULT = False
 
 # ── World / Grid ─────────────────────────────────────────────────────────────
 TILE_SIZE  = 64          # pixels per tile (world scale)
-MAP_COLS   = 160
-MAP_ROWS   = 120
+MAP_COLS   = 192
+MAP_ROWS   = 144
+MAX_MAJOR_KINGDOMS = 5
+MAX_ACTIVE_KINGDOMS = 8
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 CAM_SPEED        = 600   # world px / second at zoom=1
@@ -26,6 +28,12 @@ HUD_FULL_SHOW_MS = 2200
 HUD_IDLE_HIDE_MS = 7000
 GRID_ALPHA_MIN   = 16
 GRID_ALPHA_MAX   = 52
+POLITICAL_TICK_S = 0.33
+UPKEEP_TICK_S    = 1.8
+MUTINY_STABILITY_THRESHOLD = 18.0
+DESERTION_STABILITY_THRESHOLD = 34.0
+CAPITAL_FOOD_MIN_DAYS = 3.5
+CAPITAL_GOLD_MIN_DAYS = 3.0
 
 # ── Environment animation ─────────────────────────────────────────────────────
 WATER_ANIM_FPS = 3.5

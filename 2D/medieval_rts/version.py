@@ -1,5 +1,5 @@
 APP_NAME = "MedievalKingdomsRTS"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 VERSION_TAG = f"v{VERSION}"
 
 GITHUB_OWNER = "LordEpasus"

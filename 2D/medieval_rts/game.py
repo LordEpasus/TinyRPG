@@ -7,11 +7,18 @@ import pygame
 
 from settings import (
     COMPAT_SPRITES,
+    CAPITAL_FOOD_MIN_DAYS,
+    CAPITAL_GOLD_MIN_DAYS,
+    DESERTION_STABILITY_THRESHOLD,
     FPS,
     HUD_FULL_SHOW_MS,
     HUD_IDLE_HIDE_MS,
     MAP_COLS,
     MAP_ROWS,
+    MAX_ACTIVE_KINGDOMS,
+    MAX_MAJOR_KINGDOMS,
+    MUTINY_STABILITY_THRESHOLD,
+    POLITICAL_TICK_S,
     SPAWN_SAFE_RADIUS,
     TILE_DIRT,
     TILE_GRASS,
@@ -19,6 +26,7 @@ from settings import (
     TILE_SIZE,
     TINY_SWORDS,
     TITLE,
+    UPKEEP_TICK_S,
     GREEN,
     WHITE,
     YELLOW,
@@ -83,33 +91,46 @@ class Game:
         Ship._sid_seq = 0
 
         all_civs = ("Blue", "Red", "Yellow", "Purple", "Black")
-        self.player_civilization = player_civilization if player_civilization in all_civs else "Blue"
+        self.major_civilizations = all_civs[:MAX_MAJOR_KINGDOMS]
+        self.player_civilization = player_civilization if player_civilization in self.major_civilizations else "Blue"
+        self.player_kingdom_id = self.player_civilization
         self.scenario = str(scenario or "skirmish")
         self.campaign_mission = int(campaign_mission)
+        self.online_opponent_civ = (
+            online_opponent_civ if online_opponent_civ in self.major_civilizations else None
+        )
 
-        if net is not None and online_opponent_civ:
-            remaining = [c for c in all_civs if c not in (self.player_civilization, online_opponent_civ)]
-            self.ai_civilizations = remaining[:2]
-            self.enemy_civilizations = [online_opponent_civ, *self.ai_civilizations]
+        self.human_civilizations: list[str] = [self.player_civilization]
+        if net is not None and self.online_opponent_civ and self.online_opponent_civ not in self.human_civilizations:
+            self.human_civilizations.append(self.online_opponent_civ)
+
+        full_roster = self.scenario not in ("tutorial", "campaign")
+        if full_roster:
+            self.ai_civilizations = [c for c in self.major_civilizations if c not in self.human_civilizations]
+            self.enemy_civilizations = [c for c in self.major_civilizations if c != self.player_civilization]
         else:
-            enemy_choices = [c for c in all_civs if c != self.player_civilization]
-            self.ai_civilizations = enemy_choices[:3]
-            self.enemy_civilizations = enemy_choices[:3]
-
-        if self.scenario == "tutorial":
-            self.ai_civilizations = self.enemy_civilizations[:1]
-            self.enemy_civilizations = self.enemy_civilizations[:1]
-        elif self.scenario == "campaign":
-            if self.campaign_mission == 1:
+            if net is not None and self.online_opponent_civ:
+                remaining = [c for c in self.major_civilizations if c not in (self.player_civilization, self.online_opponent_civ)]
+                self.ai_civilizations = remaining[:2]
+                self.enemy_civilizations = [self.online_opponent_civ, *self.ai_civilizations]
+            else:
+                enemy_choices = [c for c in self.major_civilizations if c != self.player_civilization]
+                self.ai_civilizations = enemy_choices[:3]
+                self.enemy_civilizations = enemy_choices[:3]
+            if self.scenario == "tutorial":
                 self.ai_civilizations = self.enemy_civilizations[:1]
                 self.enemy_civilizations = self.enemy_civilizations[:1]
-            else:
-                self.ai_civilizations = self.enemy_civilizations[:2]
-                self.enemy_civilizations = self.enemy_civilizations[:2]
+            elif self.scenario == "campaign":
+                if self.campaign_mission == 1:
+                    self.ai_civilizations = self.enemy_civilizations[:1]
+                    self.enemy_civilizations = self.enemy_civilizations[:1]
+                else:
+                    self.ai_civilizations = self.enemy_civilizations[:2]
+                    self.enemy_civilizations = self.enemy_civilizations[:2]
 
         self.enemy_civilization = self.enemy_civilizations[0] if self.enemy_civilizations else "Red"
         self.map_seed = int(map_seed) if map_seed is not None else random.SystemRandom().randint(1, 2_147_483_647)
-        Unit.PLAYER_CIVILIZATION = self.player_civilization
+        Unit.PLAYER_CIVILIZATION = self.player_kingdom_id
         mode_tag = "LAN" if net is not None else "SP"
         pygame.display.set_caption(f"{TITLE} - {self.player_civilization} [{mode_tag}] - Seed {self.map_seed}")
         self.clock = pygame.time.Clock()
@@ -121,24 +142,28 @@ class Game:
         self._building_blocked_tiles: set[tuple[int, int]] = set()
         self._building_resource_reserved_tiles: set[tuple[int, int]] = set()
         self._tree_skip_tiles: set[tuple[int, int]] = set()
-        self._spawn_tiles = self._default_spawn_tiles()
-        spawn_centers = [self._tile_to_world(col, row) for col, row in self._spawn_tiles.values()]
-        self._spawn_world = spawn_centers[0]
-        self._enemy_spawn_world = spawn_centers[-1]
+        self._kingdom_split_seq = 0
+        self._political_tick_timer_s = POLITICAL_TICK_S
+        self._upkeep_tick_timer_s = UPKEEP_TICK_S
+        self._hero_mode = False
+        self._hero_input_send_s = 0.0
+        self._hero_last_axis = (0, 0)
+        self._hero_last_attack = False
+        self._player_hero_uid = 0
+        self._last_stock_broadcast: dict[str, tuple[tuple[str, int], ...]] = {}
 
         self.camera = Camera()
         self.tilemap = TileMap(
             seed=self.map_seed,
-            spawn_centers=spawn_centers,
             spawn_safe_radius=SPAWN_SAFE_RADIUS,
         )
+        self._spawn_worlds, self._civ_spawn_worlds = self._build_spawn_registry()
+        self._spawn_world = self._civ_spawn_worlds[self.player_civilization]
+        self._enemy_spawn_world = self._civ_spawn_worlds.get(self.enemy_civilization, self._spawn_world)
+        self.tilemap.apply_spawn_safe_zones(list(self._civ_spawn_worlds.values()))
         self.pathfinder = Pathfinder(self.tilemap)
         self.tree_sets = self._load_tree_sets()
-        self._spawn_worlds = self._resolve_spawn_worlds(spawn_centers)
-        self._civ_spawn_worlds = self._assign_civ_spawn_worlds()
         self._spawn_civ_order = self._compute_spawn_civ_order()
-        self._spawn_world = self._civ_spawn_worlds[self.player_civilization]
-        self._enemy_spawn_world = self._civ_spawn_worlds.get(self.enemy_civilization, self._spawn_worlds["SE"])
 
         self.buildings: list[Building] = []
         self.ships: list[Ship] = []
@@ -162,9 +187,11 @@ class Game:
         self._chaos_state_timer_s = 0.0
         self._civ_sync_timer_s = 0.0
         self._chaos_factions = {"OrcRed", "OrcYellow", "SlimeBlue", "SlimePink"}
-        self._formation_modes = ("box", "line", "wedge")
+        self._formation_modes = ("square", "triangle", "circle")
         self._formation_mode_idx = 0
         self.civilizations: dict[str, Civilization] = {}
+        self._kingdom_lineages: dict[str, list[str]] = {}
+        self._register_major_kingdoms()
 
         self.resource_manager: ResourceManager | None = None
         self._spawn_start_buildings()
@@ -174,14 +201,16 @@ class Game:
             self.tilemap,
             seed=self.map_seed,
             forbidden_tiles=forbidden_nodes,
-            starting_resources={"gold": 1000, "wood": 1000, "stone": 1000, "food": 0, "meat": 0},
+            starting_resources={"gold": 1000, "wood": 1000, "stone": 1000, "food": 220, "meat": 120},
         )
         if self.scenario == "tutorial":
-            self.resource_manager.resources.update({"gold": 1200, "wood": 1200, "stone": 1200, "food": 90, "meat": 80})
+            self.resource_manager.resources.update({"gold": 1200, "wood": 1200, "stone": 1200, "food": 260, "meat": 140})
         elif self.scenario == "campaign" and self.campaign_mission == 1:
-            self.resource_manager.resources.update({"gold": 1300, "wood": 1250, "stone": 1100, "food": 120, "meat": 60})
+            self.resource_manager.resources.update({"gold": 1300, "wood": 1250, "stone": 1100, "food": 280, "meat": 120})
         elif self.scenario == "campaign":
-            self.resource_manager.resources.update({"gold": 1500, "wood": 1300, "stone": 1300, "food": 150, "meat": 80})
+            self.resource_manager.resources.update({"gold": 1500, "wood": 1300, "stone": 1300, "food": 320, "meat": 160})
+        player_civ = self._get_or_create_civilization(self.player_kingdom_id)
+        player_civ.set_stockpile(self.resource_manager.resources)
         self._refresh_tree_skip_tiles()
 
         self._base_storage = {
@@ -208,7 +237,7 @@ class Game:
             ctrl = AIController(
                 self,
                 civilization=civ,
-                enemy_civilization=self.player_civilization,
+                enemy_civilization=self.player_kingdom_id,
                 seed=self.map_seed + (i + 1) * 101,
                 base_world=self._civ_spawn_worlds.get(civ),
             )
@@ -224,7 +253,7 @@ class Game:
         self._update_storage_capacity()
         self._sync_civilizations()
 
-        all_known_civs = {self.player_civilization, *self.enemy_civilizations, *self.ai_civilizations}
+        all_known_civs = set(self.major_civilizations)
         self.tech_tree = TechTree(sorted(all_known_civs))
         self._ai_age_timer_s = 0.0
         for unit in self.units:
@@ -234,7 +263,7 @@ class Game:
             1
             for b in self.buildings
             if (
-                b.civilization == self.player_civilization
+                b.kingdom_id == self.player_kingdom_id
                 and b.building_type in (Building.TYPE_HOUSE1, Building.TYPE_HOUSE2, Building.TYPE_HOUSE3)
             )
         )
@@ -263,8 +292,13 @@ class Game:
                 meta={
                     "seed": int(self.map_seed),
                     "player_civilization": self.player_civilization,
+                    "player_kingdom_id": self.player_kingdom_id,
                     "scenario": self.scenario,
                     "campaign_mission": int(self.campaign_mission),
+                    "kingdom_names": {kid: civ.display_name for kid, civ in self.civilizations.items()},
+                    "spawn_plan": {
+                        civ: [round(world[0], 2), round(world[1], 2)] for civ, world in self._civ_spawn_worlds.items()
+                    },
                 },
             )
         self._replay_summary = self.replay.summary() if self.replay.is_playback else {}
@@ -485,48 +519,94 @@ class Game:
             row * TILE_SIZE + TILE_SIZE // 2,
         )
 
-    def _default_spawn_tiles(self) -> dict[str, tuple[int, int]]:
-        margin_col = max(14, MAP_COLS // 6)
-        margin_row = max(12, MAP_ROWS // 6)
-        return {
-            "NW": (margin_col, margin_row),
-            "NE": (MAP_COLS - margin_col - 1, margin_row),
-            "SW": (margin_col, MAP_ROWS - margin_row - 1),
-            "SE": (MAP_COLS - margin_col - 1, MAP_ROWS - margin_row - 1),
-        }
+    def _build_spawn_registry(self) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]]]:
+        count = min(len(self.major_civilizations), MAX_MAJOR_KINGDOMS)
+        spawn_worlds = self.tilemap.sample_spawn_worlds(
+            count=count,
+            seed=self.map_seed,
+            margin=max(10, min(MAP_COLS, MAP_ROWS) // 14),
+            min_distance_tiles=max(24, min(MAP_COLS, MAP_ROWS) // 5),
+        )
+        if len(spawn_worlds) < count:
+            while len(spawn_worlds) < count:
+                spawn_worlds.append(self.tilemap.tile_center(self.tilemap.cols // 2, self.tilemap.rows // 2))
 
-    def _resolve_spawn_worlds(self, spawn_centers: list[tuple[float, float]]) -> dict[str, tuple[float, float]]:
-        keys = ("NW", "NE", "SW", "SE")
+        labels = self._label_spawn_worlds(spawn_worlds)
+        rng = random.Random(self.map_seed + 441)
+        civ_order = list(self.major_civilizations[:count])
+        rng.shuffle(civ_order)
+        civ_worlds = {
+            civ_order[i]: self._find_spawn_world_near(spawn_worlds[i][0], spawn_worlds[i][1])
+            for i in range(count)
+        }
+        return labels, civ_worlds
+
+    def _label_spawn_worlds(self, spawn_worlds: list[tuple[float, float]]) -> dict[str, tuple[float, float]]:
+        ordered = sorted(spawn_worlds, key=lambda item: (item[1], item[0]))
+        labels = ("NW", "NE", "CENTER", "SW", "SE")
+        if len(ordered) <= 4:
+            labels = ("NW", "NE", "SW", "SE")
         out: dict[str, tuple[float, float]] = {}
-        for i, key in enumerate(keys):
-            wx, wy = spawn_centers[i]
-            out[key] = self._find_spawn_world_near(wx, wy)
+        for idx, world in enumerate(ordered):
+            key = labels[min(idx, len(labels) - 1)]
+            out[key] = world
         return out
 
-    def _assign_civ_spawn_worlds(self) -> dict[str, tuple[float, float]]:
-        # Multiplayer (LAN): host side (player_id=0) is NW, guest side is NE.
-        if self._network_enabled and self.online_opponent_civ:
-            host_civ = self.player_civilization if self.player_id == 0 else self.online_opponent_civ
-            guest_civ = self.online_opponent_civ if self.player_id == 0 else self.player_civilization
-            mapping: dict[str, tuple[float, float]] = {
-                host_civ: self._spawn_worlds["NW"],
-                guest_civ: self._spawn_worlds["NE"],
-            }
-            if self.ai_civilizations:
-                mapping[self.ai_civilizations[0]] = self._spawn_worlds["SW"]
-            if len(self.ai_civilizations) > 1:
-                mapping[self.ai_civilizations[1]] = self._spawn_worlds["SE"]
-            return mapping
+    def _kingdom_palette_color(self, asset_color: str) -> tuple[int, int, int]:
+        return Unit.CIV_COLORS.get(asset_color, (180, 180, 180))
 
-        # Single-player: player starts NW; AI kingdoms occupy remaining corners.
-        corners = ("NW", "NE", "SW", "SE")
-        mapping: dict[str, tuple[float, float]] = {
-            self.player_civilization: self._spawn_worlds[corners[0]],
-        }
-        for i, civ in enumerate(self.enemy_civilizations):
-            corner = corners[min(i + 1, len(corners) - 1)]
-            mapping[civ] = self._spawn_worlds[corner]
-        return mapping
+    def _kingdom_display_color(self, kingdom_id: str, asset_color: str) -> tuple[int, int, int]:
+        base = self._kingdom_palette_color(asset_color)
+        if kingdom_id == asset_color:
+            return base
+        shift = (sum(ord(ch) for ch in kingdom_id) % 49) - 24
+        return tuple(max(36, min(240, c + shift)) for c in base)
+
+    def _generate_kingdom_name(self, asset_color: str, *, ordinal: int = 0, parent: str | None = None) -> str:
+        prefixes = ["Aurel", "Briar", "Corven", "Dunwall", "Eldor", "Falken", "Grey", "Halden", "Iron", "Jade"]
+        suffixes = ["reach", "gard", "moor", "crest", "heim", "watch", "hold", "mere", "wyn", "fall"]
+        houses = ["House", "Order", "Crown", "March", "Banner", "League"]
+        seed = self.map_seed + sum(ord(ch) for ch in asset_color) * 19 + ordinal * 131 + (17 if parent else 0)
+        rng = random.Random(seed)
+        realm = f"{rng.choice(prefixes)}{rng.choice(suffixes)}"
+        if parent:
+            return f"{rng.choice(houses)} of {realm}"
+        return f"Kingdom of {realm}"
+
+    def _register_kingdom(
+        self,
+        kingdom_id: str,
+        *,
+        asset_color: str,
+        is_major: bool,
+        parent_kingdom_id: str | None = None,
+        initial_stockpile: dict[str, int] | None = None,
+    ) -> Civilization:
+        civ = self.civilizations.get(kingdom_id)
+        if civ is not None:
+            return civ
+        lineage = list(self._kingdom_lineages.get(parent_kingdom_id or kingdom_id, [parent_kingdom_id or kingdom_id]))
+        if kingdom_id not in lineage:
+            lineage.append(kingdom_id)
+        self._kingdom_lineages[kingdom_id] = lineage
+        crest = asset_color[0].upper() if is_major else f"{asset_color[0].upper()}{len(lineage)}"
+        civ = Civilization(
+            kingdom_id=kingdom_id,
+            asset_color=asset_color,
+            display_name=self._generate_kingdom_name(asset_color, ordinal=max(0, len(lineage) - 1), parent=parent_kingdom_id),
+            parent_kingdom_id=parent_kingdom_id,
+            is_major=is_major,
+            crest=crest,
+            display_color=self._kingdom_display_color(kingdom_id, asset_color),
+        )
+        civ.set_stockpile(initial_stockpile or {"gold": 1000, "wood": 1000, "stone": 1000, "food": 220, "meat": 120})
+        self.civilizations[kingdom_id] = civ
+        return civ
+
+    def _register_major_kingdoms(self) -> None:
+        stock = {"gold": 1000, "wood": 1000, "stone": 1000, "food": 220, "meat": 120}
+        for civ in self.major_civilizations:
+            self._register_kingdom(civ, asset_color=civ, is_major=True, initial_stockpile=stock)
 
     def _spawn_buffer_tiles(self, radius: int) -> set[tuple[int, int]]:
         tiles: set[tuple[int, int]] = set()
@@ -546,16 +626,10 @@ class Game:
         return tiles
 
     def _compute_spawn_civ_order(self) -> list[str]:
-        order: list[str] = []
-        for corner in ("NW", "NE", "SW", "SE"):
-            corner_world = self._spawn_worlds[corner]
-            civ = next((name for name, world in self._civ_spawn_worlds.items() if world == corner_world), None)
-            if civ is not None and civ not in order:
-                order.append(civ)
-        for civ in sorted(self._civ_spawn_worlds):
-            if civ not in order:
-                order.append(civ)
-        return order
+        return [
+            civ
+            for civ, _ in sorted(self._civ_spawn_worlds.items(), key=lambda item: (item[1][1], item[1][0], item[0]))
+        ]
 
     def _find_anchor_near(
         self,
@@ -607,25 +681,24 @@ class Game:
             wy,
             building_type=building_type,
             civilization=civilization,
+            kingdom_id=civilization,
             max_hp=self._max_hp_for_building(building_type),
             start_progress=1.0,
         )
         if b.building_type == Building.TYPE_TOWER:
             b.is_dock = self._building_touches_water(b.footprint_tiles(self.tilemap))
         self.buildings.append(b)
+        civ = self._get_or_create_civilization(civilization)
+        if building_type == Building.TYPE_CASTLE and civ.capital_building_id is None:
+            civ.capital_building_id = id(b)
         return b
 
     def _spawn_start_buildings(self) -> None:
-        plans: list[tuple[str, tuple[float, float]]] = []
-        if self._network_enabled:
-            for civ in self._spawn_civ_order:
-                if civ in self._civ_spawn_worlds:
-                    plans.append((civ, self._civ_spawn_worlds[civ]))
-        else:
-            plans.append((self.player_civilization, self._civ_spawn_worlds[self.player_civilization]))
-            for civ in self.enemy_civilizations:
-                if civ in self._civ_spawn_worlds:
-                    plans.append((civ, self._civ_spawn_worlds[civ]))
+        plans = [
+            (civ, self._civ_spawn_worlds[civ])
+            for civ in self._spawn_civ_order
+            if civ in self._civ_spawn_worlds
+        ]
         house_offsets = [(-5, 2), (5, 2)]
 
         for civilization, (swx, swy) in plans:
@@ -645,9 +718,14 @@ class Game:
     def _spawn_civ_start_units(self, civilization: str, center: tuple[float, float]) -> None:
         cx, cy = center
         hx, hy = self._find_spawn_world_near(cx, cy - 16)
-        self.units.append(Unit(hx, hy, civilization=civilization, unit_class=Unit.ROLE_HERO))
+        hero = Unit(hx, hy, civilization=civilization, kingdom_id=civilization, unit_class=Unit.ROLE_HERO)
+        self.units.append(hero)
+        civ = self._get_or_create_civilization(civilization)
+        civ.ruler_unit_id = int(hero.uid)
+        if civilization == self.player_kingdom_id:
+            self._player_hero_uid = int(hero.uid)
         mx, my = self._find_spawn_world_near(cx + 36, cy + 66)
-        self.units.append(Unit(mx, my, civilization=civilization, unit_class=Unit.ROLE_MONK))
+        self.units.append(Unit(mx, my, civilization=civilization, kingdom_id=civilization, unit_class=Unit.ROLE_MONK))
 
         formation = [
             (90, 0),
@@ -663,6 +741,7 @@ class Game:
                     wx,
                     wy,
                     civilization=civilization,
+                    kingdom_id=civilization,
                     unit_class=Unit.ROLE_WORKER,
                 )
             )
@@ -691,6 +770,35 @@ class Game:
     def _is_chaos_civ(civilization: str) -> bool:
         return civilization.startswith("Orc") or civilization.startswith("Slime")
 
+    @staticmethod
+    def _entity_kingdom_id(entity) -> str:
+        return str(getattr(entity, "kingdom_id", getattr(entity, "civilization", "")))
+
+    @staticmethod
+    def _entity_asset_color(entity) -> str:
+        return str(getattr(entity, "asset_color", getattr(entity, "civilization", "")))
+
+    def _is_player_owned(self, entity) -> bool:
+        return self._entity_kingdom_id(entity) == self.player_kingdom_id
+
+    def _same_kingdom(self, left, right) -> bool:
+        return self._entity_kingdom_id(left) == self._entity_kingdom_id(right)
+
+    def _is_hostile_entity(self, left, right) -> bool:
+        return self._entity_kingdom_id(left) != self._entity_kingdom_id(right)
+
+    def _player_hero(self) -> Unit | None:
+        hero = self._unit_from_uid(self._player_hero_uid)
+        if hero is not None and not hero.is_dead:
+            return hero
+        for unit in self.units:
+            if unit.is_dead:
+                continue
+            if unit.kingdom_id == self.player_kingdom_id and unit.unit_class == Unit.ROLE_HERO:
+                self._player_hero_uid = int(unit.uid)
+                return unit
+        return None
+
     def _spawn_chaos_units(self) -> None:
         anchors = [
             self._spawn_worlds["NE"],
@@ -709,54 +817,173 @@ class Game:
                 off_x = ((i % 2) - 0.5) * TILE_SIZE * 1.2
                 off_y = (i // 2) * TILE_SIZE * 0.9
                 wx, wy = self._find_spawn_world_near(ax + off_x, ay + off_y)
-                self.units.append(Unit(wx, wy, civilization=civilization, unit_class=unit_class))
+                self.units.append(Unit(wx, wy, civilization=civilization, kingdom_id=civilization, unit_class=unit_class))
 
-    def _get_or_create_civilization(self, color: str) -> Civilization:
-        civ = self.civilizations.get(color)
+    def _get_or_create_civilization(self, kingdom_id: str, asset_color: str | None = None) -> Civilization:
+        civ = self.civilizations.get(kingdom_id)
         if civ is not None:
             return civ
-        civ = Civilization(color=color)
-        self.civilizations[color] = civ
-        return civ
+        color = asset_color or kingdom_id
+        return self._register_kingdom(kingdom_id, asset_color=color, is_major=(kingdom_id in self.major_civilizations))
 
     def _sync_civilizations(self) -> None:
-        fixed = ("Blue", "Red", "Yellow", "Purple", "Black")
+        fixed = tuple(self.major_civilizations)
         for key in fixed:
-            self._get_or_create_civilization(key)
+            self._get_or_create_civilization(key, key)
         for civ in self.civilizations.values():
             civ.units.clear()
             civ.buildings.clear()
 
         for unit in self.units:
-            civ = self._get_or_create_civilization(unit.civilization)
+            civ = self._get_or_create_civilization(unit.kingdom_id, unit.asset_color)
             civ.add_unit(unit)
+            if civ.ruler_unit_id is None and unit.unit_class == Unit.ROLE_HERO:
+                civ.ruler_unit_id = int(unit.uid)
         for building in self.buildings:
             if building.is_dead:
                 continue
-            civ = self._get_or_create_civilization(building.civilization)
+            civ = self._get_or_create_civilization(building.kingdom_id, building.asset_color)
             civ.add_building(building)
+            if (
+                building.building_type == Building.TYPE_CASTLE
+                and building.is_complete
+                and (
+                    civ.capital_building_id is None
+                    or not any(id(b) == civ.capital_building_id and not b.is_dead for b in civ.buildings)
+                )
+            ):
+                civ.capital_building_id = id(building)
 
-        player = self._get_or_create_civilization(self.player_civilization)
-        player.resources = {
-            "gold": self.resource_manager.resources.get("gold", 0),
-            "wood": self.resource_manager.resources.get("wood", 0),
-            "stone": self.resource_manager.resources.get("stone", 0),
-        }
-        for civ in self.enemy_civilizations:
-            enemy = self._get_or_create_civilization(civ)
-            ctrl = self._ai_by_civ.get(civ)
+        player = self._get_or_create_civilization(self.player_kingdom_id, self.player_civilization)
+        player.set_stockpile(self.resource_manager.resources)
+        for civ_key in list(self.civilizations):
+            ctrl = self._ai_by_civ.get(civ_key)
             if ctrl is None:
                 continue
-            enemy.resources = {
-                "gold": ctrl.resources.get("gold", 0),
-                "wood": ctrl.resources.get("wood", 0),
-                "stone": ctrl.resources.get("stone", 0),
-            }
+            self._sync_ai_resource_cache(civ_key)
 
     def _spawn_enemy_units(self) -> None:
         # Backward-compatible hook for all AI factions.
         for ai in self.ai_controllers:
             ai.bootstrap()
+
+    def _active_civilized_kingdom_ids(self) -> list[str]:
+        return [
+            kid
+            for kid, civ in self.civilizations.items()
+            if (not self._is_chaos_civ(civ.asset_color)) and (civ.units or civ.buildings or civ.is_major)
+        ]
+
+    def _kingdom(self, kingdom_id: str) -> Civilization:
+        return self._get_or_create_civilization(kingdom_id)
+
+    def _kingdom_can_afford(self, kingdom_id: str, costs: dict[str, int]) -> bool:
+        return self._kingdom(kingdom_id).can_afford(costs)
+
+    def _sync_ai_resource_cache(self, kingdom_id: str) -> None:
+        ctrl = getattr(self, "_ai_by_civ", {}).get(kingdom_id)
+        if ctrl is None:
+            return
+        ctrl.resources = dict(self._kingdom(kingdom_id).capital_stockpile)
+
+    def _stock_signature(self, kingdom_id: str) -> tuple[tuple[str, int], ...]:
+        stock = self._kingdom(kingdom_id).capital_stockpile
+        return tuple(sorted((key, int(stock.get(key, 0))) for key in ("gold", "wood", "stone", "food", "meat")))
+
+    def _net_send_capital_stock(self, kingdom_id: str, *, reason: str = "adjust", force: bool = False) -> None:
+        if not self._should_broadcast_kingdom_state(kingdom_id):
+            return
+        civ = self._kingdom(kingdom_id)
+        stock = {key: int(civ.capital_stockpile.get(key, 0)) for key in ("gold", "wood", "stone", "food", "meat")}
+        signature = tuple(sorted(stock.items()))
+        if not force and self._last_stock_broadcast.get(kingdom_id) == signature:
+            return
+        self._last_stock_broadcast[kingdom_id] = signature
+        self._net_send(
+            {
+                "type": protocol.MSG_CAPITAL_STOCK,
+                "civ": civ.asset_color,
+                "kingdom_id": kingdom_id,
+                "stock": stock,
+                "reason": reason,
+            }
+        )
+
+    def _kingdom_spend(self, kingdom_id: str, costs: dict[str, int]) -> bool:
+        ok = self._kingdom(kingdom_id).spend(costs)
+        if not ok:
+            return False
+        self._sync_ai_resource_cache(kingdom_id)
+        if kingdom_id == self.player_kingdom_id:
+            self._sync_player_resource_manager()
+        self._net_send_capital_stock(kingdom_id, reason="spend")
+        return ok
+
+    def _kingdom_gain(self, kingdom_id: str, resource_type: str, amount: int) -> int:
+        gained = self._kingdom(kingdom_id).gain(resource_type, amount)
+        if gained <= 0:
+            return gained
+        self._sync_ai_resource_cache(kingdom_id)
+        if kingdom_id == self.player_kingdom_id:
+            self._sync_player_resource_manager()
+        self._net_send_capital_stock(kingdom_id, reason=f"gain:{resource_type}")
+        return gained
+
+    def _kingdom_consume_food(self, kingdom_id: str, amount: int = 1) -> bool:
+        ok = self._kingdom(kingdom_id).consume_food(amount)
+        if not ok:
+            return False
+        self._sync_ai_resource_cache(kingdom_id)
+        if kingdom_id == self.player_kingdom_id:
+            self._sync_player_resource_manager()
+        return ok
+
+    def _sync_player_resource_manager(self) -> None:
+        if self.resource_manager is None:
+            return
+        civ = self._get_or_create_civilization(self.player_kingdom_id, self.player_civilization)
+        self.resource_manager.resources.update(civ.capital_stockpile)
+
+    def _capital_for_kingdom(self, kingdom_id: str) -> Building | None:
+        civ = self._get_or_create_civilization(kingdom_id)
+        building = next((b for b in civ.buildings if id(b) == civ.capital_building_id and not b.is_dead), None)
+        if building is not None:
+            return building
+        castles = [
+            b
+            for b in civ.buildings
+            if (not b.is_dead and b.is_complete and b.building_type == Building.TYPE_CASTLE)
+        ]
+        if not castles:
+            civ.capital_building_id = None
+            return None
+        building = max(castles, key=lambda b: float(b.hp))
+        civ.capital_building_id = id(building)
+        return building
+
+    def _kingdom_display_name(self, kingdom_id: str) -> str:
+        return self._get_or_create_civilization(kingdom_id).display_name or kingdom_id
+
+    def _should_broadcast_kingdom_state(self, kingdom_id: str) -> bool:
+        if not self._network_enabled:
+            return True
+        if kingdom_id == self.player_kingdom_id:
+            return True
+        if kingdom_id in self.human_civilizations:
+            return False
+        return self.player_id == 0
+
+    def _kingdom_display_color_value(self, kingdom_id: str) -> tuple[int, int, int]:
+        civ = self._get_or_create_civilization(kingdom_id)
+        civ.display_color = self._kingdom_display_color(kingdom_id, civ.asset_color)
+        return tuple(civ.display_color)
+
+    def _entity_display_color(self, entity) -> tuple[int, int, int]:
+        kingdom_id = self._entity_kingdom_id(entity)
+        asset_color = self._entity_asset_color(entity) or kingdom_id
+        civ = self._get_or_create_civilization(kingdom_id, asset_color)
+        civ.display_color = self._kingdom_display_color(kingdom_id, civ.asset_color)
+        return tuple(civ.display_color)
 
     # ── Network helpers ───────────────────────────────────────────────────────
     def _reindex_units(self) -> None:
@@ -797,6 +1024,11 @@ class Game:
             protocol.MSG_BUILD,
             protocol.MSG_SHIP_MOVE,
             protocol.MSG_UNIT_STANCE,
+            protocol.MSG_HERO_MODE,
+            protocol.MSG_HERO_INPUT,
+            protocol.MSG_FORMATION_SET,
+            protocol.MSG_KINGDOM_SPLIT,
+            protocol.MSG_CAPITAL_STOCK,
             protocol.MSG_TECH_START,
             protocol.MSG_TECH_AGE,
         }
@@ -816,6 +1048,7 @@ class Game:
             {
                 "type": protocol.MSG_DISCONNECT,
                 "civ": self.player_civilization,
+                "kingdom_id": self.player_kingdom_id,
                 "player_id": int(self.player_id),
             }
         )
@@ -826,6 +1059,7 @@ class Game:
             {
                 "type": protocol.MSG_UNIT_MOVE,
                 "civ": unit.civilization,
+                "kingdom_id": unit.kingdom_id,
                 "unit_id": int(unit.uid),
                 "tx": int(tx),
                 "ty": int(ty),
@@ -837,6 +1071,7 @@ class Game:
             {
                 "type": protocol.MSG_UNIT_GATHER,
                 "civ": unit.civilization,
+                "kingdom_id": unit.kingdom_id,
                 "unit_id": int(unit.uid),
                 "resource": str(getattr(node, "resource_type", "")),
                 "tx": int(getattr(node, "col", 0)),
@@ -848,6 +1083,7 @@ class Game:
         msg: dict[str, object] = {
             "type": protocol.MSG_UNIT_ATTACK,
             "civ": attacker.civilization,
+            "kingdom_id": attacker.kingdom_id,
             "attacker": int(attacker.uid),
             "target_kind": "unit",
             "target_id": -1,
@@ -864,13 +1100,14 @@ class Game:
         self._net_send(msg)
 
     def _net_send_unit_stance(self, units: list[Unit], stance: str) -> None:
-        ids = [int(u.uid) for u in units if (not u.is_dead and u.civilization == self.player_civilization)]
+        ids = [int(u.uid) for u in units if (not u.is_dead and u.kingdom_id == self.player_kingdom_id)]
         if not ids:
             return
         self._net_send(
             {
                 "type": protocol.MSG_UNIT_STANCE,
                 "civ": self.player_civilization,
+                "kingdom_id": self.player_kingdom_id,
                 "stance": stance,
                 "unit_ids": ids,
             }
@@ -881,6 +1118,7 @@ class Game:
             {
                 "type": protocol.MSG_TECH_AGE,
                 "civ": self.player_civilization,
+                "kingdom_id": self.player_kingdom_id,
                 "age": age,
             }
         )
@@ -890,6 +1128,7 @@ class Game:
             {
                 "type": protocol.MSG_BUILD,
                 "civ": civilization,
+                "kingdom_id": civilization,
                 "building": building_type,
                 "tx": int(anchor[0]),
                 "ty": int(anchor[1]),
@@ -902,6 +1141,7 @@ class Game:
             {
                 "type": protocol.MSG_SPAWN_UNIT,
                 "civ": unit.civilization,
+                "kingdom_id": unit.kingdom_id,
                 "unit_type": unit.unit_class.title(),
                 "unit_id": int(unit.uid),
                 "tx": int(tx),
@@ -915,6 +1155,7 @@ class Game:
             {
                 "type": protocol.MSG_SPAWN_UNIT,
                 "civ": ship.civilization,
+                "kingdom_id": ship.kingdom_id,
                 "unit_type": "Ship",
                 "ship_id": int(ship.sid),
                 "tx": int(tx),
@@ -934,6 +1175,7 @@ class Game:
         msg: dict[str, object] = {
             "type": protocol.MSG_SHIP_MOVE,
             "civ": ship.civilization,
+            "kingdom_id": ship.kingdom_id,
             "ship_id": int(ship.sid),
             "tx": int(tx),
             "ty": int(ty),
@@ -959,7 +1201,7 @@ class Game:
         for building in reversed(self.buildings):
             if building.is_dead:
                 continue
-            if enemy_of is not None and building.civilization == enemy_of:
+            if enemy_of is not None and building.kingdom_id == enemy_of:
                 continue
             if (col, row) in building.footprint_tiles(self.tilemap):
                 return building
@@ -967,9 +1209,10 @@ class Game:
 
     def _apply_remote_spawn_unit(self, msg: dict[str, object], *, allow_local_civ: bool = False) -> None:
         civ = str(msg.get("civ", ""))
+        kingdom_id = str(msg.get("kingdom_id", civ))
         if not civ:
             return
-        if not allow_local_civ and civ == self.player_civilization:
+        if not allow_local_civ and kingdom_id == self.player_kingdom_id:
             return
         unit_type = str(msg.get("unit_type", "Worker")).lower()
         tx = int(msg.get("tx", 0))
@@ -980,7 +1223,7 @@ class Game:
             sid = int(msg.get("ship_id", 0))
             if sid > 0 and self._ship_from_sid(sid) is not None:
                 return
-            ship = Ship(wx, wy, civilization=civ)
+            ship = Ship(wx, wy, civilization=civ, kingdom_id=kingdom_id)
             if sid > 0:
                 ship.sid = sid
                 Ship._sid_seq = max(int(Ship._sid_seq), sid)
@@ -991,7 +1234,7 @@ class Game:
         uid = int(msg.get("unit_id", 0))
         if uid > 0 and self._unit_from_uid(uid) is not None:
             return
-        unit = Unit(wx, wy, civilization=civ, unit_class=unit_type)
+        unit = Unit(wx, wy, civilization=civ, kingdom_id=kingdom_id, unit_class=unit_type)
         if uid > 0:
             unit.uid = uid
             Unit._uid_seq = max(int(Unit._uid_seq), uid)
@@ -1001,14 +1244,15 @@ class Game:
     def _apply_command_message(self, msg: dict[str, object], *, allow_local_civ: bool = False) -> None:
         msg_type = str(msg.get("type", ""))
         civ = str(msg.get("civ", ""))
+        kingdom_id = str(msg.get("kingdom_id", civ))
         if not msg_type or not civ:
             return
-        if not allow_local_civ and civ == self.player_civilization:
+        if not allow_local_civ and kingdom_id == self.player_kingdom_id:
             return
 
         if msg_type == protocol.MSG_UNIT_MOVE:
             unit = self._unit_from_uid(int(msg.get("unit_id", -1)))
-            if unit is None or unit.civilization != civ:
+            if unit is None or unit.kingdom_id != kingdom_id:
                 return
             tx = int(msg.get("tx", 0))
             ty = int(msg.get("ty", 0))
@@ -1024,7 +1268,7 @@ class Game:
 
         if msg_type == protocol.MSG_UNIT_GATHER:
             unit = self._unit_from_uid(int(msg.get("unit_id", -1)))
-            if unit is None or unit.civilization != civ:
+            if unit is None or unit.kingdom_id != kingdom_id:
                 return
             tx = int(msg.get("tx", -1))
             ty = int(msg.get("ty", -1))
@@ -1042,14 +1286,14 @@ class Game:
 
         if msg_type == protocol.MSG_UNIT_ATTACK:
             attacker = self._unit_from_uid(int(msg.get("attacker", -1)))
-            if attacker is None or attacker.civilization != civ:
+            if attacker is None or attacker.kingdom_id != kingdom_id:
                 return
             target_kind = str(msg.get("target_kind", "unit"))
             target = None
             if target_kind == "building":
                 tx = int(msg.get("tx", -1))
                 ty = int(msg.get("ty", -1))
-                target = self._building_at_tile(tx, ty, enemy_of=attacker.civilization)
+                target = self._building_at_tile(tx, ty, enemy_of=attacker.kingdom_id)
             else:
                 target = self._unit_from_uid(int(msg.get("target_id", -1)))
             if target is None:
@@ -1068,20 +1312,20 @@ class Game:
                 return
             for raw_uid in raw_ids:
                 unit = self._unit_from_uid(int(raw_uid))
-                if unit is None or unit.civilization != civ:
+                if unit is None or unit.kingdom_id != kingdom_id:
                     continue
                 unit.set_stance(stance)
             return
 
         if msg_type == protocol.MSG_TECH_START:
-            if self.tech_tree.can_start_age_up(civ):
-                self.tech_tree.start_age_up(civ)
+            if self.tech_tree.can_start_age_up(kingdom_id):
+                self.tech_tree.start_age_up(kingdom_id)
             return
 
         if msg_type == protocol.MSG_TECH_AGE:
             age = str(msg.get("age", ""))
             if age:
-                self._set_civilization_age(civ, age)
+                self._set_civilization_age(kingdom_id, age)
             return
 
         if msg_type == "produce":
@@ -1091,7 +1335,7 @@ class Game:
             if slot < 0:
                 return
             building = self._building_at_tile(tx, ty)
-            if building is None or building.civilization != civ:
+            if building is None or building.kingdom_id != kingdom_id:
                 return
             options = building.production_options()
             if 0 <= slot < len(options):
@@ -1108,7 +1352,7 @@ class Game:
             self._place_building_at_anchor(
                 (tx, ty),
                 building_type,
-                civilization=civ,
+                civilization=kingdom_id,
                 spend_cost=False,
                 selected_workers=[],
                 auto_remote_builders=True,
@@ -1119,7 +1363,7 @@ class Game:
 
         if msg_type == protocol.MSG_SHIP_MOVE:
             ship = self._ship_from_sid(int(msg.get("ship_id", -1)))
-            if ship is None or ship.civilization != civ:
+            if ship is None or ship.kingdom_id != kingdom_id:
                 return
             tx = int(msg.get("tx", -1))
             ty = int(msg.get("ty", -1))
@@ -1137,6 +1381,55 @@ class Game:
 
         if msg_type == protocol.MSG_SPAWN_UNIT:
             self._apply_remote_spawn_unit(msg, allow_local_civ=allow_local_civ)
+            return
+
+        if msg_type == protocol.MSG_FORMATION_SET:
+            form = str(msg.get("formation", ""))
+            if form in self._formation_modes:
+                self._formation_mode_idx = self._formation_modes.index(form)
+            return
+
+        if msg_type == protocol.MSG_HERO_MODE:
+            enabled = bool(msg.get("enabled", False))
+            if kingdom_id == self.player_kingdom_id:
+                self._hero_mode = enabled
+            return
+
+        if msg_type == protocol.MSG_HERO_INPUT:
+            unit = self._player_hero() if kingdom_id == self.player_kingdom_id else None
+            if unit is None:
+                for cand in self.units:
+                    if cand.kingdom_id == kingdom_id and cand.unit_class == Unit.ROLE_HERO and not cand.is_dead:
+                        unit = cand
+                        break
+            if unit is None:
+                return
+            ax = max(-1, min(1, int(msg.get("ax", 0))))
+            ay = max(-1, min(1, int(msg.get("ay", 0))))
+            if ax or ay:
+                step = TILE_SIZE * 1.3
+                unit.move_to(
+                    unit.world_pos.x + ax * step,
+                    unit.world_pos.y + ay * step,
+                    pathfinder=self.pathfinder,
+                    blocked_tiles=self._building_blocked_tiles,
+                )
+            return
+
+        if msg_type == protocol.MSG_KINGDOM_SPLIT:
+            self._apply_remote_kingdom_split(msg)
+            return
+
+        if msg_type == protocol.MSG_CAPITAL_STOCK:
+            stock = msg.get("stock", {})
+            if isinstance(stock, dict):
+                civ_obj = self._get_or_create_civilization(kingdom_id, civ or kingdom_id)
+                civ_obj.set_stockpile({key: int(val) for key, val in stock.items()})
+                self._last_stock_broadcast[kingdom_id] = self._stock_signature(kingdom_id)
+                self._sync_ai_resource_cache(kingdom_id)
+                if kingdom_id == self.player_kingdom_id:
+                    self._sync_player_resource_manager()
+            return
 
     def _process_network_messages(self) -> None:
         if not self._network_enabled or self.net is None:
@@ -1195,6 +1488,7 @@ class Game:
             (
                 int(u.uid),
                 u.civilization,
+                u.kingdom_id,
                 u.unit_class,
                 round(float(u.world_pos.x), 1),
                 round(float(u.world_pos.y), 1),
@@ -1209,6 +1503,7 @@ class Game:
         build_blob = [
             (
                 b.civilization,
+                b.kingdom_id,
                 b.building_type,
                 int(self.tilemap.world_to_tile(b.world_pos.x, b.world_pos.y)[0]),
                 int(self.tilemap.world_to_tile(b.world_pos.x, b.world_pos.y)[1]),
@@ -1225,6 +1520,7 @@ class Game:
             (
                 int(s.sid),
                 s.civilization,
+                s.kingdom_id,
                 round(float(s.world_pos.x), 1),
                 round(float(s.world_pos.y), 1),
                 int(round(float(s.hp))),
@@ -1234,7 +1530,25 @@ class Game:
         ]
         ship_blob.sort(key=lambda x: x[0])
 
-        payload = f"{unit_blob}|{build_blob}|{ship_blob}|{self.tech_tree.serialize()}"
+        kingdom_blob = [
+            (
+                kid,
+                civ.asset_color,
+                civ.display_name,
+                round(float(civ.stability), 2),
+                round(float(civ.loyalty), 2),
+                round(float(civ.split_cooldown), 2),
+                round(float(civ.food_upkeep_progress), 3),
+                round(float(civ.gold_upkeep_progress), 3),
+                tuple(sorted((k, int(v)) for k, v in civ.capital_stockpile.items())),
+                civ.parent_kingdom_id or "",
+                civ.crest,
+                1 if civ.is_major else 0,
+            )
+            for kid, civ in self.civilizations.items()
+        ]
+        kingdom_blob.sort(key=lambda item: item[0])
+        payload = f"{unit_blob}|{build_blob}|{ship_blob}|{kingdom_blob}|{self.tech_tree.serialize()}"
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
     def _serialize_sync_state(self) -> dict[str, object]:
@@ -1243,6 +1557,7 @@ class Game:
                 {
                     "uid": int(u.uid),
                     "civ": u.civilization,
+                    "kingdom_id": u.kingdom_id,
                     "cls": u.unit_class,
                     "x": float(u.world_pos.x),
                     "y": float(u.world_pos.y),
@@ -1256,6 +1571,7 @@ class Game:
             "buildings": [
                 {
                     "civ": b.civilization,
+                    "kingdom_id": b.kingdom_id,
                     "type": b.building_type,
                     "x": float(b.world_pos.x),
                     "y": float(b.world_pos.y),
@@ -1272,6 +1588,7 @@ class Game:
                 {
                     "sid": int(s.sid),
                     "civ": s.civilization,
+                    "kingdom_id": s.kingdom_id,
                     "x": float(s.world_pos.x),
                     "y": float(s.world_pos.y),
                     "hp": float(s.hp),
@@ -1279,6 +1596,25 @@ class Game:
                 }
                 for s in self.ships
             ],
+            "kingdoms": {
+                kid: {
+                    "asset_color": civ.asset_color,
+                    "display_name": civ.display_name,
+                    "parent": civ.parent_kingdom_id,
+                    "stability": float(civ.stability),
+                    "loyalty": float(civ.loyalty),
+                    "split_cooldown": float(civ.split_cooldown),
+                    "food_upkeep_progress": float(civ.food_upkeep_progress),
+                    "gold_upkeep_progress": float(civ.gold_upkeep_progress),
+                    "stock": dict(civ.capital_stockpile),
+                    "ruler_uid": civ.ruler_unit_id,
+                    "capital_id": civ.capital_building_id,
+                    "is_major": bool(civ.is_major),
+                    "crest": civ.crest,
+                    "display_color": list(civ.display_color),
+                }
+                for kid, civ in self.civilizations.items()
+            },
             "tech": self.tech_tree.serialize(),
         }
 
@@ -1286,10 +1622,35 @@ class Game:
         raw_units = payload.get("units", [])
         raw_buildings = payload.get("buildings", [])
         raw_ships = payload.get("ships", [])
+        raw_kingdoms = payload.get("kingdoms", {})
         raw_tech = payload.get("tech", {})
 
         if isinstance(raw_tech, dict):
             self.tech_tree.apply_serialized(raw_tech)
+
+        if isinstance(raw_kingdoms, dict):
+            for kid, item in raw_kingdoms.items():
+                if not isinstance(item, dict):
+                    continue
+                civ = self._get_or_create_civilization(str(kid), str(item.get("asset_color", kid)))
+                civ.asset_color = str(item.get("asset_color", civ.asset_color))
+                civ.display_name = str(item.get("display_name", civ.display_name))
+                civ.parent_kingdom_id = item.get("parent") or None
+                civ.stability = float(item.get("stability", civ.stability))
+                civ.loyalty = float(item.get("loyalty", civ.loyalty))
+                civ.split_cooldown = float(item.get("split_cooldown", civ.split_cooldown))
+                civ.food_upkeep_progress = float(item.get("food_upkeep_progress", civ.food_upkeep_progress))
+                civ.gold_upkeep_progress = float(item.get("gold_upkeep_progress", civ.gold_upkeep_progress))
+                civ.ruler_unit_id = item.get("ruler_uid") if item.get("ruler_uid") is not None else civ.ruler_unit_id
+                civ.capital_building_id = item.get("capital_id") if item.get("capital_id") is not None else civ.capital_building_id
+                civ.is_major = bool(item.get("is_major", civ.is_major))
+                civ.crest = str(item.get("crest", civ.crest))
+                display_color = item.get("display_color")
+                if isinstance(display_color, list) and len(display_color) == 3:
+                    civ.display_color = tuple(int(v) for v in display_color)
+                stock = item.get("stock", {})
+                if isinstance(stock, dict):
+                    civ.set_stockpile({k: int(v) for k, v in stock.items()})
 
         if isinstance(raw_units, list):
             keep_uids: set[int] = set()
@@ -1302,6 +1663,7 @@ class Game:
                     continue
                 keep_uids.add(uid)
                 civ = str(item.get("civ", "Blue"))
+                kingdom_id = str(item.get("kingdom_id", civ))
                 cls = str(item.get("cls", Unit.ROLE_WORKER))
                 x = float(item.get("x", 0.0))
                 y = float(item.get("y", 0.0))
@@ -1312,12 +1674,14 @@ class Game:
 
                 unit = by_uid.get(uid)
                 if unit is None:
-                    unit = Unit(x, y, civilization=civ, unit_class=cls)
+                    unit = Unit(x, y, civilization=civ, kingdom_id=kingdom_id, unit_class=cls)
                     unit.uid = uid
                     Unit._uid_seq = max(Unit._uid_seq, uid)
                     self.units.append(unit)
                     by_uid[uid] = unit
                 unit.civilization = civ
+                unit.asset_color = civ
+                unit.kingdom_id = kingdom_id
                 unit.unit_class = cls
                 unit.world_pos.update(x, y)
                 unit.max_hp = max_hp
@@ -1341,6 +1705,7 @@ class Game:
                 if not isinstance(item, dict):
                     continue
                 civ = str(item.get("civ", "Blue"))
+                kingdom_id = str(item.get("kingdom_id", civ))
                 btype = str(item.get("type", Building.TYPE_HOUSE1))
                 x = float(item.get("x", 0.0))
                 y = float(item.get("y", 0.0))
@@ -1353,12 +1718,15 @@ class Game:
                         y,
                         building_type=btype,
                         civilization=civ,
+                        kingdom_id=kingdom_id,
                         max_hp=max(1, int(item.get("max_hp", 1000))),
                         start_progress=float(item.get("progress", 1.0)),
                     )
                     self.buildings.append(b)
                     existing[key] = b
                 b.world_pos.update(x, y)
+                b.asset_color = civ
+                b.kingdom_id = kingdom_id
                 b.max_hp = max(1, int(item.get("max_hp", b.max_hp)))
                 b.hp = max(0.0, min(float(b.max_hp), float(item.get("hp", b.hp))))
                 b.build_progress = max(0.0, min(1.0, float(item.get("progress", b.build_progress))))
@@ -1382,16 +1750,19 @@ class Game:
                     continue
                 keep_sids.add(sid)
                 civ = str(item.get("civ", "Blue"))
+                kingdom_id = str(item.get("kingdom_id", civ))
                 x = float(item.get("x", 0.0))
                 y = float(item.get("y", 0.0))
                 ship = existing.get(sid)
                 if ship is None:
-                    ship = Ship(x, y, civilization=civ)
+                    ship = Ship(x, y, civilization=civ, kingdom_id=kingdom_id)
                     ship.sid = sid
                     Ship._sid_seq = max(Ship._sid_seq, sid)
                     self.ships.append(ship)
                     existing[sid] = ship
                 ship.civilization = civ
+                ship.asset_color = civ
+                ship.kingdom_id = kingdom_id
                 ship.world_pos.update(x, y)
                 ship.hp = max(1.0, float(item.get("hp", ship.hp)))
                 cargo = item.get("cargo", {})
@@ -1418,26 +1789,27 @@ class Game:
         st.researching_remaining_s = 0.0
         st.researching_total_s = 0.0
         for unit in self.units:
-            if unit.civilization == civ:
+            if unit.kingdom_id == civ:
                 self._apply_unit_age_bonus(unit)
 
     def _apply_unit_age_bonus(self, unit: Unit) -> None:
-        scale = self.tech_tree.age_multiplier(unit.civilization)
+        scale = self.tech_tree.age_multiplier(unit.kingdom_id)
         unit.apply_combat_scale(scale)
 
     def _try_age_up_player(self) -> bool:
-        if not self.tech_tree.can_start_age_up(self.player_civilization):
+        if not self.tech_tree.can_start_age_up(self.player_kingdom_id):
             return False
-        costs = self.tech_tree.next_age_cost(self.player_civilization)
-        if not costs or not self.resource_manager.can_afford(costs):
+        costs = self.tech_tree.next_age_cost(self.player_kingdom_id)
+        if not costs or not self._kingdom_can_afford(self.player_kingdom_id, costs):
             return False
-        self.resource_manager.spend(costs)
-        ok = self.tech_tree.start_age_up(self.player_civilization)
+        self._kingdom_spend(self.player_kingdom_id, costs)
+        ok = self.tech_tree.start_age_up(self.player_kingdom_id)
         if ok:
             self._net_send(
                 {
                     "type": protocol.MSG_TECH_START,
                     "civ": self.player_civilization,
+                    "kingdom_id": self.player_kingdom_id,
                 }
             )
         return ok
@@ -1455,15 +1827,9 @@ class Game:
             costs = self.tech_tree.next_age_cost(civ)
             if not costs:
                 continue
-            can = True
-            for key, val in costs.items():
-                if ctrl.resources.get(key, 0) < int(val):
-                    can = False
-                    break
-            if not can:
+            if not self._kingdom_can_afford(civ, costs):
                 continue
-            for key, val in costs.items():
-                ctrl.resources[key] = max(0, ctrl.resources.get(key, 0) - int(val))
+            self._kingdom_spend(civ, costs)
             self.tech_tree.start_age_up(civ)
 
     def _network_tick_update(self, dt: float) -> None:
@@ -1480,6 +1846,7 @@ class Game:
                     "tick": int(self._sync_tick),
                     "hash": self._compute_state_hash(),
                     "civ": self.player_civilization,
+                    "kingdom_id": self.player_kingdom_id,
                 }
             )
 
@@ -1533,10 +1900,19 @@ class Game:
                         self.running = False
                     continue
                 if event.key == pygame.K_ESCAPE:
-                    if self._build_mode_type is not None:
+                    if self._hero_mode:
+                        self._set_hero_mode(False)
+                    elif self._build_mode_type is not None:
                         self._build_mode_type = None
                     else:
                         self.running = False
+                elif event.key == pygame.K_c:
+                    self._set_hero_mode(not self._hero_mode)
+                elif self._hero_mode:
+                    if event.key == pygame.K_F1:
+                        self._hud_pinned = not self._hud_pinned
+                        self._mark_activity()
+                    continue
                 elif event.key == pygame.K_g:
                     self.show_grid = not self.show_grid
                 elif event.key == pygame.K_b:
@@ -1560,6 +1936,14 @@ class Game:
                     self._set_selected_stance(Unit.STANCE_HOLD)
                 elif event.key == pygame.K_F5:
                     self._formation_mode_idx = (self._formation_mode_idx + 1) % len(self._formation_modes)
+                    self._net_send(
+                        {
+                            "type": protocol.MSG_FORMATION_SET,
+                            "civ": self.player_civilization,
+                            "kingdom_id": self.player_kingdom_id,
+                            "formation": self._formation_mode(),
+                        }
+                    )
                     self._mark_activity()
                 elif event.key == pygame.K_h:
                     self._try_age_up_player()
@@ -1590,8 +1974,13 @@ class Game:
                 if self.replay.is_playback:
                     continue
                 if event.button == 1:
+                    if self._hero_mode:
+                        self._hero_mode_primary_action(event.pos)
+                        continue
                     self._on_left_down(event.pos, keys)
                 elif event.button == 3:
+                    if self._hero_mode:
+                        continue
                     self._on_right_click(event.pos)
 
             elif event.type == pygame.MOUSEBUTTONUP:
@@ -1617,7 +2006,7 @@ class Game:
 
         hit_building = next((b for b in reversed(self.buildings) if b.contains_point(wx, wy)), None)
         if hit_building is not None:
-            if hit_building.civilization != self.player_civilization:
+            if not self._is_player_owned(hit_building):
                 self._selected_enemy_unit = None
                 self._selected_node = None
                 self._clear_building_selection()
@@ -1630,7 +2019,7 @@ class Game:
 
         hit_ship = next((s for s in reversed(self.ships) if s.contains_point(wx, wy)), None)
         if hit_ship is not None:
-            if hit_ship.civilization != self.player_civilization:
+            if not self._is_player_owned(hit_ship):
                 return
             if not shift:
                 self._deselect_all()
@@ -1647,7 +2036,7 @@ class Game:
         if hit_unit is not None:
             if hit_unit.is_dead:
                 return
-            if hit_unit.civilization != self.player_civilization:
+            if not self._is_player_owned(hit_unit):
                 self._selected_enemy_unit = hit_unit
                 self._selected_node = None
                 self._clear_building_selection()
@@ -1688,7 +2077,7 @@ class Game:
         if rect.width > 4 and rect.height > 4:
             for unit in self.units:
                 sx, sy = self.camera.world_to_screen(unit.world_pos)
-                if rect.collidepoint(sx, sy):
+                if rect.collidepoint(sx, sy) and self._is_player_owned(unit):
                     self._select(unit)
         self._box_start = None
 
@@ -1712,7 +2101,7 @@ class Game:
             (
                 ship
                 for ship in reversed(self.ships)
-                if ship.civilization == self.player_civilization and ship.contains_point(wx, wy)
+                if self._is_player_owned(ship) and ship.contains_point(wx, wy)
             ),
             None,
         )
@@ -1734,7 +2123,7 @@ class Game:
             (
                 b
                 for b in reversed(self.buildings)
-                if b.under_construction and b.civilization == self.player_civilization and b.contains_point(wx, wy)
+                if b.under_construction and self._is_player_owned(b) and b.contains_point(wx, wy)
             ),
             None,
         )
@@ -1748,7 +2137,7 @@ class Game:
             (
                 b
                 for b in reversed(self.buildings)
-                if b.can_garrison_archers and b.contains_point(wx, wy)
+                if b.can_garrison_archers and self._is_player_owned(b) and b.contains_point(wx, wy)
             ),
             None,
         )
@@ -1775,7 +2164,7 @@ class Game:
             return
 
         spacing = max(56, Unit.DISPLAY_SIZE * 0.86)
-        offsets = self._formation_offsets(n, spacing)
+        offsets = self._formation_offsets_for_units(self._selected, spacing)
         for i, unit in enumerate(self._selected):
             self._worker_haul.pop(id(unit), None)
             off_x, off_y = offsets[i]
@@ -1788,12 +2177,87 @@ class Game:
             self._net_send_unit_move(unit, wx + off_x, wy + off_y)
         self.sound.play("move")
 
+    def _set_hero_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled and self._player_hero() is None:
+            enabled = False
+        if self._hero_mode == enabled:
+            return
+        self._hero_mode = enabled
+        if enabled:
+            self._deselect_all()
+            hero = self._player_hero()
+            if hero is not None:
+                hero.selected = True
+                self._selected = [hero]
+                self.camera.center_on_world(hero.world_pos.x, hero.world_pos.y)
+        self._net_send(
+            {
+                "type": protocol.MSG_HERO_MODE,
+                "civ": self.player_civilization,
+                "kingdom_id": self.player_kingdom_id,
+                "enabled": enabled,
+            }
+        )
+
+    def _hero_mode_primary_action(self, pos) -> None:
+        hero = self._player_hero()
+        if hero is None or hero.is_dead:
+            return
+        wx, wy = self.camera.screen_to_world(pos)
+        enemy = next((u for u in self.units if (not u.is_dead and u.contains_point(wx, wy) and hero.is_hostile_to(u))), None)
+        if enemy is None:
+            enemy_building = next(
+                (b for b in reversed(self.buildings) if (not b.is_dead and b.contains_point(wx, wy) and b.kingdom_id != hero.kingdom_id)),
+                None,
+            )
+            if enemy_building is not None:
+                hero.attack_command(enemy_building, pathfinder=self.pathfinder, blocked_tiles=self._building_blocked_tiles)
+                self._net_send_unit_attack(hero, enemy_building)
+                self.sound.play("attack")
+                return
+            hero.move_to(wx, wy, pathfinder=self.pathfinder, blocked_tiles=self._building_blocked_tiles)
+            self._net_send_unit_move(hero, wx, wy)
+            self.sound.play("move")
+            return
+        hero.attack_command(enemy, pathfinder=self.pathfinder, blocked_tiles=self._building_blocked_tiles)
+        self._net_send_unit_attack(hero, enemy)
+        self.sound.play("attack")
+
+    def _update_hero_mode(self, dt: float, keys) -> None:
+        if not self._hero_mode:
+            return
+        hero = self._player_hero()
+        if hero is None or hero.is_dead:
+            self._hero_mode = False
+            return
+        ax = int(bool(keys[pygame.K_d])) - int(bool(keys[pygame.K_a]))
+        ay = int(bool(keys[pygame.K_s])) - int(bool(keys[pygame.K_w]))
+        self._hero_input_send_s -= dt
+        if (ax, ay) != self._hero_last_axis or (ax or ay) and self._hero_input_send_s <= 0.0:
+            self._hero_last_axis = (ax, ay)
+            self._hero_input_send_s = 0.12
+            self._net_send(
+                {
+                    "type": protocol.MSG_HERO_INPUT,
+                    "civ": hero.civilization,
+                    "kingdom_id": hero.kingdom_id,
+                    "unit_id": int(hero.uid),
+                    "ax": int(ax),
+                    "ay": int(ay),
+                }
+            )
+        if ax or ay:
+            dest_x = hero.world_pos.x + ax * TILE_SIZE * 1.2
+            dest_y = hero.world_pos.y + ay * TILE_SIZE * 1.2
+            hero.move_to(dest_x, dest_y, pathfinder=self.pathfinder, blocked_tiles=self._building_blocked_tiles)
+
     def _issue_ship_command(self, wx: float, wy: float) -> None:
         if not self._selected_ships:
             return
         tc, tr = self.tilemap.world_to_tile(wx, wy)
         on_water = self.tilemap.get_tile(tc, tr) == TILE_WATER
-        ships = [ship for ship in self._selected_ships if ship.civilization == self.player_civilization]
+        ships = [ship for ship in self._selected_ships if self._is_player_owned(ship)]
         if not ships:
             return
 
@@ -1854,7 +2318,7 @@ class Game:
             return False
         boarded_any = False
         for unit in self._selected:
-            if unit.is_dead or unit.civilization != self.player_civilization:
+            if unit.is_dead or not self._is_player_owned(unit):
                 continue
             if ship.request_board(
                 unit,
@@ -1867,7 +2331,7 @@ class Game:
     # ── Build placement ───────────────────────────────────────────────────────
     def _has_selected_worker(self) -> bool:
         return any(
-            unit.can_construct and unit.civilization == self.player_civilization and not unit.is_dead
+            unit.can_construct and unit.kingdom_id == self.player_kingdom_id and not unit.is_dead
             for unit in self._selected
         )
 
@@ -1905,7 +2369,7 @@ class Game:
         placed = self._place_building_at_anchor(
             anchor,
             self._build_mode_type,
-            civilization=self.player_civilization,
+            civilization=self.player_kingdom_id,
             spend_cost=True,
             selected_workers=workers,
             auto_remote_builders=False,
@@ -1935,15 +2399,17 @@ class Game:
             return None
         if spend_cost:
             costs = Building.build_cost(building_type)
-            if not self.resource_manager.spend(costs):
+            if not self._kingdom_spend(civilization, costs):
                 return None
 
         bx, by = self.tilemap.tile_center(anchor[0], anchor[1])
+        asset_color = self._get_or_create_civilization(civilization).asset_color
         b = Building(
             bx,
             by,
             building_type=building_type,
-            civilization=civilization,
+            civilization=asset_color,
+            kingdom_id=civilization,
             max_hp=self._max_hp_for_building(building_type),
             start_progress=0.05,
         )
@@ -1960,7 +2426,7 @@ class Game:
                     u
                     for u in self.units
                     if (
-                        u.civilization == civilization
+                        u.kingdom_id == civilization
                         and u.can_construct
                         and not u.is_dead
                     )
@@ -1970,7 +2436,7 @@ class Game:
         if workers:
             self._issue_construction(b, workers)
 
-        if civilization == self.player_civilization:
+        if civilization == self.player_kingdom_id:
             self._selected_node = None
             self._selected_enemy_unit = None
             if select_new:
@@ -2053,7 +2519,7 @@ class Game:
         if friend is None:
             return None
         for building in reversed(self.buildings):
-            if building.is_dead or building.civilization == friend.civilization:
+            if building.is_dead or building.kingdom_id == friend.kingdom_id:
                 continue
             if building.contains_point(wx, wy):
                 return building
@@ -2063,7 +2529,7 @@ class Game:
         attackers = [
             u
             for u in self._selected
-            if (not u.is_dead and u.can_attack and u.civilization == self.player_civilization)
+            if (not u.is_dead and u.can_attack and u.kingdom_id == self.player_kingdom_id)
         ]
         if not attackers:
             return
@@ -2083,7 +2549,7 @@ class Game:
         units = [
             u
             for u in self._selected
-            if (not u.is_dead and u.civilization == self.player_civilization and u.can_attack)
+            if (not u.is_dead and u.kingdom_id == self.player_kingdom_id and u.can_attack)
         ]
         if not units:
             return
@@ -2093,23 +2559,17 @@ class Game:
 
     def _formation_mode(self) -> str:
         if not self._formation_modes:
-            return "box"
+            return "square"
         idx = max(0, min(len(self._formation_modes) - 1, int(self._formation_mode_idx)))
         return self._formation_modes[idx]
 
-    def _formation_offsets(self, count: int, spacing: float) -> list[tuple[float, float]]:
+    def _formation_slots(self, count: int, spacing: float) -> list[tuple[float, float]]:
         n = max(1, int(count))
         sp = max(26.0, float(spacing))
         mode = self._formation_mode()
         out: list[tuple[float, float]] = []
 
-        if mode == "line":
-            for i in range(n):
-                off_x = (i - (n - 1) / 2) * sp
-                out.append((off_x, 0.0))
-            return out
-
-        if mode == "wedge":
+        if mode == "triangle":
             row = 0
             placed = 0
             while placed < n:
@@ -2125,6 +2585,13 @@ class Game:
             center_y = sum(v[1] for v in out) / len(out)
             return [(ox, oy - center_y) for ox, oy in out]
 
+        if mode == "circle":
+            radius = max(sp * 0.9, (n * sp) / math.tau / 1.25)
+            for i in range(n):
+                ang = (-math.pi / 2.0) + (i / n) * math.tau
+                out.append((math.cos(ang) * radius, math.sin(ang) * radius))
+            return out
+
         cols = max(1, round(n ** 0.5))
         rows = max(1, (n + cols - 1) // cols)
         for i in range(n):
@@ -2134,6 +2601,32 @@ class Game:
             off_y = (row - (rows - 1) / 2) * sp
             out.append((off_x, off_y))
         return out
+
+    def _formation_offsets_for_units(self, units: list[Unit], spacing: float) -> list[tuple[float, float]]:
+        if not units:
+            return []
+        slots = self._formation_slots(len(units), spacing)
+        majority_workers = sum(1 for unit in units if unit.can_gather) > len(units) / 2
+
+        def role_rank(unit: Unit) -> tuple[int, int]:
+            if unit.unit_class in (Unit.ROLE_HERO, Unit.ROLE_LANCER, Unit.ROLE_WARRIOR):
+                rank = 0
+            elif unit.unit_class == Unit.ROLE_MONK:
+                rank = 1
+            elif unit.unit_class == Unit.ROLE_ARCHER:
+                rank = 2
+            elif unit.can_gather and majority_workers:
+                rank = 2
+            else:
+                rank = 3
+            return rank, int(unit.uid)
+
+        ordered_units = sorted(enumerate(units), key=lambda item: role_rank(item[1]))
+        ordered_slots = sorted(slots, key=lambda item: (item[1], item[0]))
+        mapped: list[tuple[float, float] | None] = [None] * len(units)
+        for (src_idx, _unit), slot in zip(ordered_units, ordered_slots):
+            mapped[src_idx] = slot
+        return [slot if slot is not None else (0.0, 0.0) for slot in mapped]
 
     def _construction_positions(self, building: Building) -> list[tuple[float, float]]:
         footprint = building.footprint_tiles(self.tilemap)
@@ -2166,7 +2659,7 @@ class Game:
         workers = [
             w
             for w in workers
-            if (w.can_construct and not w.is_dead and w.civilization == building.civilization)
+            if (w.can_construct and not w.is_dead and w.kingdom_id == building.kingdom_id)
         ]
         if not workers:
             return
@@ -2185,7 +2678,7 @@ class Game:
         workers = [
             unit
             for unit in self._selected
-            if unit.can_gather and unit.civilization == self.player_civilization and not unit.is_dead
+            if unit.can_gather and unit.kingdom_id == self.player_kingdom_id and not unit.is_dead
         ]
         n = len(workers)
         if n <= 0:
@@ -2225,7 +2718,7 @@ class Game:
         workers = [
             unit
             for unit in self._selected
-            if unit.can_gather and unit.civilization == self.player_civilization and not unit.is_dead
+            if unit.can_gather and unit.kingdom_id == self.player_kingdom_id and not unit.is_dead
         ]
         if not workers:
             self.sound.play("error")
@@ -2252,7 +2745,7 @@ class Game:
             b
             for b in self.buildings
             if (
-                b.civilization == civilization
+                b.kingdom_id == civilization
                 and b.building_type == Building.TYPE_CASTLE
                 and not b.is_dead
                 and b.is_complete
@@ -2266,7 +2759,9 @@ class Game:
         )
 
     def _choose_deposit_target(self, unit: Unit, resource_type: str) -> tuple[str, object, float, float] | None:
-        castle = self._nearest_friendly_castle(unit.civilization, unit.world_pos.x, unit.world_pos.y)
+        castle = self._capital_for_kingdom(unit.kingdom_id) or self._nearest_friendly_castle(
+            unit.kingdom_id, unit.world_pos.x, unit.world_pos.y
+        )
         if castle is not None:
             anchor = castle.spawn_anchor()
             path = self.pathfinder.find_path_world(
@@ -2281,7 +2776,7 @@ class Game:
             ships = [
                 s
                 for s in self.ships
-                if s.civilization == unit.civilization and s.has_cargo_space()
+                if s.kingdom_id == unit.kingdom_id and s.has_cargo_space()
             ]
             if ships:
                 ship = min(
@@ -2297,8 +2792,8 @@ class Game:
             return
         target = self._choose_deposit_target(unit, node.resource_type)
         if target is None:
-            gained = self.resource_manager.gain(node.resource_type, taken)
-            if unit.civilization == self.player_civilization and gained > 0:
+            gained = self._kingdom_gain(unit.kingdom_id, node.resource_type, taken)
+            if unit.kingdom_id == self.player_kingdom_id and gained > 0:
                 self.tutorial.add_collected(gained)
                 if node.resource_type == "gold":
                     self.sound.play("gold")
@@ -2340,13 +2835,13 @@ class Game:
 
             if depot_kind == "castle":
                 if not isinstance(depot, Building) or depot.is_dead:
-                    self.resource_manager.gain(resource_type, amount)
+                    self._kingdom_gain(unit.kingdom_id, resource_type, amount)
                     done_ids.append(uid)
                     continue
                 tx, ty = depot.spawn_anchor()
             else:
                 if not isinstance(depot, Ship):
-                    self.resource_manager.gain(resource_type, amount)
+                    self._kingdom_gain(unit.kingdom_id, resource_type, amount)
                     done_ids.append(uid)
                     continue
                 tx, ty = depot.world_pos.x, depot.world_pos.y
@@ -2359,10 +2854,10 @@ class Game:
             gained = 0
             if depot_kind == "ship" and isinstance(depot, Ship):
                 stored = depot.store_resource(resource_type, amount)
-                gained = self.resource_manager.gain(resource_type, stored)
+                gained = 0 if stored > 0 else self._kingdom_gain(unit.kingdom_id, resource_type, amount)
             else:
-                gained = self.resource_manager.gain(resource_type, amount)
-            if unit.civilization == self.player_civilization and gained > 0:
+                gained = self._kingdom_gain(unit.kingdom_id, resource_type, amount)
+            if unit.kingdom_id == self.player_kingdom_id and gained > 0:
                 self.tutorial.add_collected(gained)
                 if resource_type == "gold":
                     self.sound.play("gold")
@@ -2383,6 +2878,289 @@ class Game:
 
         for uid in done_ids:
             self._worker_haul.pop(uid, None)
+
+    def _deliver_ship_cargo_to_capitals(self) -> None:
+        for ship in self.ships:
+            if ship.cargo_used <= 0:
+                continue
+            capital = self._capital_for_kingdom(ship.kingdom_id)
+            if capital is None:
+                continue
+            tx, ty = capital.spawn_anchor()
+            dx = tx - ship.world_pos.x
+            dy = ty - ship.world_pos.y
+            if dx * dx + dy * dy > (TILE_SIZE * 2.4) ** 2:
+                continue
+            for resource_type, amount in list(ship.cargo.items()):
+                if amount <= 0:
+                    continue
+                self._kingdom_gain(ship.kingdom_id, resource_type, amount)
+                ship.cargo[resource_type] = 0
+
+    @staticmethod
+    def _kingdom_upkeep_rates(civ: Civilization) -> tuple[float, float]:
+        combat = sum(1 for unit in civ.units if (not unit.is_dead and unit.can_attack and not unit.can_gather))
+        workers = sum(1 for unit in civ.units if (not unit.is_dead and unit.can_gather))
+        buildings = sum(1 for building in civ.buildings if not building.is_dead)
+        food_rate = combat * 0.09 + workers * 0.028 + max(0, buildings - 1) * 0.01
+        gold_rate = combat * 0.22 + workers * 0.012 + max(0, buildings - 1) * 0.05
+        return food_rate, gold_rate
+
+    def _update_upkeep_and_loyalty(self, dt: float) -> None:
+        for kingdom_id in self._active_civilized_kingdom_ids():
+            civ = self._kingdom(kingdom_id)
+            food_rate, gold_rate = self._kingdom_upkeep_rates(civ)
+            if food_rate <= 0.0 and gold_rate <= 0.0:
+                continue
+            civ.food_upkeep_progress += food_rate * max(0.0, dt)
+            civ.gold_upkeep_progress += gold_rate * max(0.0, dt)
+            food_cost = max(0, int(civ.food_upkeep_progress))
+            gold_cost = max(0, int(civ.gold_upkeep_progress))
+            civ.food_upkeep_progress -= food_cost
+            civ.gold_upkeep_progress -= gold_cost
+            if food_cost > 0:
+                remaining_food = food_cost
+                for key in ("food", "meat"):
+                    take = min(remaining_food, civ.capital_stockpile.get(key, 0))
+                    if take > 0:
+                        civ.capital_stockpile[key] -= take
+                        civ.resources[key] = civ.capital_stockpile[key]
+                        remaining_food -= take
+                    if remaining_food <= 0:
+                        break
+            if gold_cost > 0:
+                civ.capital_stockpile["gold"] = max(0, civ.capital_stockpile.get("gold", 0) - gold_cost)
+                civ.resources["gold"] = civ.capital_stockpile["gold"]
+            self._sync_ai_resource_cache(kingdom_id)
+            if kingdom_id == self.player_kingdom_id:
+                self._sync_player_resource_manager()
+            self._net_send_capital_stock(kingdom_id, reason="upkeep")
+
+    def _update_political_simulation(self, dt: float) -> None:
+        for kingdom_id in self._active_civilized_kingdom_ids():
+            civ = self._kingdom(kingdom_id)
+            capital = self._capital_for_kingdom(kingdom_id)
+            ruler_alive = any((not u.is_dead and int(u.uid) == int(civ.ruler_unit_id or -1)) for u in civ.units)
+            combat_units = sum(1 for unit in civ.units if (not unit.is_dead and unit.can_attack and not unit.can_gather))
+            frontier_units = sum(
+                1
+                for unit in civ.units
+                if (
+                    not unit.is_dead
+                    and unit.can_attack
+                    and capital is not None
+                    and (unit.world_pos.x - capital.world_pos.x) ** 2 + (unit.world_pos.y - capital.world_pos.y) ** 2
+                    > (TILE_SIZE * 12.0) ** 2
+                )
+            )
+            food_total = civ.capital_stockpile.get("food", 0) + civ.capital_stockpile.get("meat", 0)
+            gold_total = civ.capital_stockpile.get("gold", 0)
+            food_rate, gold_rate = self._kingdom_upkeep_rates(civ)
+            food_days = food_total / max(0.25, food_rate * 60.0)
+            gold_days = gold_total / max(0.25, gold_rate * 60.0)
+
+            delta = 0.0
+            if capital is None:
+                delta -= 1.6
+            else:
+                delta += 0.18
+            if ruler_alive:
+                delta += 0.12
+            else:
+                delta -= 0.9
+            if food_days < CAPITAL_FOOD_MIN_DAYS:
+                delta -= (CAPITAL_FOOD_MIN_DAYS - food_days) * 0.58
+            else:
+                delta += 0.12
+            if gold_days < CAPITAL_GOLD_MIN_DAYS:
+                delta -= (CAPITAL_GOLD_MIN_DAYS - gold_days) * 0.46
+            else:
+                delta += 0.10
+            delta -= frontier_units * 0.02
+
+            civ.stability = max(0.0, min(100.0, civ.stability + delta))
+            civ.loyalty = max(0.0, min(100.0, civ.loyalty + (civ.stability - civ.loyalty) * 0.18))
+            civ.upkeep_pressure = max(0.0, (CAPITAL_FOOD_MIN_DAYS - food_days)) + max(0.0, (CAPITAL_GOLD_MIN_DAYS - gold_days))
+            civ.split_cooldown = max(0.0, civ.split_cooldown - dt)
+
+            if civ.stability < DESERTION_STABILITY_THRESHOLD:
+                self._apply_desertion_pressure(civ, severe=civ.stability < MUTINY_STABILITY_THRESHOLD)
+            if (
+                civ.stability < MUTINY_STABILITY_THRESHOLD
+                and civ.split_cooldown <= 0.0
+                and len(self._active_civilized_kingdom_ids()) < MAX_ACTIVE_KINGDOMS
+            ):
+                self._attempt_kingdom_split(civ)
+
+    def _apply_desertion_pressure(self, civ: Civilization, *, severe: bool) -> None:
+        candidates = [
+            unit
+            for unit in civ.units
+            if (
+                not unit.is_dead
+                and unit.can_attack
+                and unit.unit_class != Unit.ROLE_HERO
+            )
+        ]
+        if len(candidates) <= 2:
+            return
+        candidates.sort(key=lambda unit: ((int(unit.uid) * 37) + self._sync_tick) % 997)
+        loss_count = 2 if severe and len(candidates) >= 6 else 1
+        for unit in candidates[:loss_count]:
+            unit.take_damage(unit.hp + 9999.0)
+
+    def _attempt_kingdom_split(self, civ: Civilization) -> bool:
+        if self._network_enabled and not self._should_broadcast_kingdom_state(civ.kingdom_id):
+            return False
+        candidates = [
+            unit
+            for unit in civ.units
+            if (
+                not unit.is_dead
+                and unit.can_attack
+                and unit.unit_class != Unit.ROLE_HERO
+            )
+        ]
+        if len(candidates) < 4:
+            return False
+        capital = self._capital_for_kingdom(civ.kingdom_id)
+        if capital is None:
+            return False
+
+        candidates.sort(
+            key=lambda unit: (unit.world_pos.x - capital.world_pos.x) ** 2 + (unit.world_pos.y - capital.world_pos.y) ** 2,
+            reverse=True,
+        )
+        split_units = candidates[: max(3, min(5, len(candidates) // 2))]
+        split_buildings = [
+            building
+            for building in civ.buildings
+            if (
+                not building.is_dead
+                and building.is_complete
+                and building.building_type != Building.TYPE_CASTLE
+                and (building.world_pos.x - capital.world_pos.x) ** 2 + (building.world_pos.y - capital.world_pos.y) ** 2
+                > (TILE_SIZE * 8.0) ** 2
+            )
+        ][:2]
+
+        self._kingdom_split_seq += 1
+        child_id = f"{civ.asset_color}_Split{self._kingdom_split_seq}"
+        if child_id in self.civilizations:
+            return False
+
+        transfer_stock = {}
+        for key in ("gold", "wood", "stone", "food", "meat"):
+            available = civ.capital_stockpile.get(key, 0)
+            transfer = max(0, int(available * 0.28))
+            civ.capital_stockpile[key] = max(0, available - transfer)
+            civ.resources[key] = civ.capital_stockpile[key]
+            transfer_stock[key] = transfer
+
+        child = self._register_kingdom(
+            child_id,
+            asset_color=civ.asset_color,
+            is_major=False,
+            parent_kingdom_id=civ.kingdom_id,
+            initial_stockpile=transfer_stock,
+        )
+        child.stability = max(28.0, civ.stability + 6.0)
+        child.loyalty = max(40.0, civ.loyalty + 4.0)
+        child.split_cooldown = 75.0
+        civ.split_cooldown = 60.0
+        self._sync_ai_resource_cache(civ.kingdom_id)
+        self._sync_ai_resource_cache(child_id)
+
+        for unit in split_units:
+            unit.kingdom_id = child_id
+        for building in split_buildings:
+            building.kingdom_id = child_id
+            if child.capital_building_id is None and building.building_type == Building.TYPE_CASTLE:
+                child.capital_building_id = id(building)
+
+        center_x = sum(unit.world_pos.x for unit in split_units) / len(split_units)
+        center_y = sum(unit.world_pos.y for unit in split_units) / len(split_units)
+        self._spawn_rebel_ai(child_id, base_world=(center_x, center_y), parent=civ.kingdom_id)
+
+        if self._should_broadcast_kingdom_state(civ.kingdom_id):
+            self._net_send(
+                {
+                    "type": protocol.MSG_KINGDOM_SPLIT,
+                    "civ": civ.asset_color,
+                    "kingdom_id": civ.kingdom_id,
+                    "child_kingdom_id": child_id,
+                    "asset_color": civ.asset_color,
+                    "parent_kingdom_id": civ.kingdom_id,
+                    "display_name": child.display_name,
+                    "unit_ids": [int(unit.uid) for unit in split_units],
+                    "building_keys": [
+                        [
+                            int(self.tilemap.world_to_tile(building.world_pos.x, building.world_pos.y)[0]),
+                            int(self.tilemap.world_to_tile(building.world_pos.x, building.world_pos.y)[1]),
+                            building.building_type,
+                        ]
+                        for building in split_buildings
+                    ],
+                    "stock": transfer_stock,
+                    "stability": float(child.stability),
+                    "loyalty": float(child.loyalty),
+                    "split_cooldown": float(child.split_cooldown),
+                }
+            )
+        self._net_send_capital_stock(civ.kingdom_id, reason="split-parent", force=True)
+        self._net_send_capital_stock(child_id, reason="split-child", force=True)
+        return True
+
+    def _apply_remote_kingdom_split(self, msg: dict[str, object]) -> None:
+        child_id = str(msg.get("child_kingdom_id", ""))
+        parent_id = str(msg.get("parent_kingdom_id", msg.get("kingdom_id", "")))
+        asset_color = str(msg.get("asset_color", msg.get("civ", parent_id)))
+        if not child_id or child_id in self.civilizations:
+            return
+        stock = msg.get("stock", {})
+        if not isinstance(stock, dict):
+            stock = {}
+        child = self._register_kingdom(
+            child_id,
+            asset_color=asset_color,
+            is_major=False,
+            parent_kingdom_id=parent_id,
+            initial_stockpile={k: int(v) for k, v in stock.items()},
+        )
+        child.display_name = str(msg.get("display_name", child.display_name))
+        child.stability = float(msg.get("stability", child.stability))
+        child.loyalty = float(msg.get("loyalty", child.loyalty))
+        child.split_cooldown = float(msg.get("split_cooldown", child.split_cooldown))
+        for raw_uid in msg.get("unit_ids", []):
+            unit = self._unit_from_uid(int(raw_uid))
+            if unit is not None:
+                unit.kingdom_id = child_id
+        for item in msg.get("building_keys", []):
+            if not isinstance(item, list) or len(item) != 3:
+                continue
+            tx, ty, btype = int(item[0]), int(item[1]), str(item[2])
+            building = self._building_at_tile(tx, ty)
+            if building is not None and building.building_type == btype:
+                building.kingdom_id = child_id
+        self._sync_ai_resource_cache(parent_id)
+        self._sync_ai_resource_cache(child_id)
+        center = self._civ_spawn_worlds.get(parent_id, self._spawn_world)
+        self._spawn_rebel_ai(child_id, base_world=center, parent=parent_id)
+
+    def _spawn_rebel_ai(self, kingdom_id: str, *, base_world: tuple[float, float], parent: str) -> None:
+        if kingdom_id in self._ai_by_civ:
+            return
+        ctrl = AIController(
+            self,
+            civilization=kingdom_id,
+            enemy_civilization=self.player_kingdom_id if kingdom_id != self.player_kingdom_id else parent,
+            seed=self.map_seed + 7000 + len(self._ai_by_civ) * 29,
+            base_world=base_world,
+            asset_color=self._get_or_create_civilization(kingdom_id).asset_color,
+        )
+        ctrl.bootstrap()
+        self.ai_controllers.append(ctrl)
+        self._ai_by_civ[kingdom_id] = ctrl
 
     # ── Building production / tools ───────────────────────────────────────────
     def _handle_building_ui_click(self, pos) -> bool:
@@ -2432,9 +3210,9 @@ class Game:
     ) -> bool:
         required_age = str(option.get("required_age", "dark"))
         if required_age in AGE_ORDER:
-            civ_age = self.tech_tree.age(building.civilization)
+            civ_age = self.tech_tree.age(building.kingdom_id)
             if AGE_ORDER.index(civ_age) < AGE_ORDER.index(required_age):
-                if building.civilization == self.player_civilization:
+                if self._is_player_owned(building):
                     self.sound.play("error")
                 return False
 
@@ -2442,11 +3220,11 @@ class Game:
         if kind == "tool":
             tool_id = str(option.get("tool_id", ""))
             if self._tool_unlocked.get(tool_id, False):
-                if building.civilization == self.player_civilization:
+                if self._is_player_owned(building):
                     self.sound.play("error")
                 return False
             if any(str(item.get("tool_id", "")) == tool_id for item in building.queue):
-                if building.civilization == self.player_civilization:
+                if self._is_player_owned(building):
                     self.sound.play("error")
                 return False
 
@@ -2455,17 +3233,17 @@ class Game:
             "wood": int(option.get("wood_cost", 0)),
             "stone": int(option.get("stone_cost", 0)),
         }
-        if not self.resource_manager.can_afford(costs):
-            if building.civilization == self.player_civilization:
+        if not self._kingdom_can_afford(building.kingdom_id, costs):
+            if self._is_player_owned(building):
                 self.sound.play("error")
             return False
         ok = building.enqueue_option(option)
         if not ok:
-            if building.civilization == self.player_civilization:
+            if self._is_player_owned(building):
                 self.sound.play("error")
             return False
-        self.resource_manager.spend(costs)
-        if self.replay.is_recording and building.civilization == self.player_civilization:
+        self._kingdom_spend(building.kingdom_id, costs)
+        if self.replay.is_recording and self._is_player_owned(building):
             tx, ty = self.tilemap.world_to_tile(building.world_pos.x, building.world_pos.y)
             slot = self._option_slot_index(building, option)
             if slot >= 0:
@@ -2474,6 +3252,7 @@ class Game:
                     {
                         "type": "produce",
                         "civ": building.civilization,
+                        "kingdom_id": building.kingdom_id,
                         "tx": int(tx),
                         "ty": int(ty),
                         "slot": int(slot),
@@ -2485,13 +3264,11 @@ class Game:
         for building in self.buildings:
             if building.is_dead:
                 continue
-            if self._network_enabled and building.civilization != self.player_civilization:
-                continue
             done = building.update(dt)
             for event in done:
                 kind = str(event.get("kind", "unit"))
                 if kind == "tool":
-                    if building.civilization == self.player_civilization:
+                    if self._is_player_owned(building):
                         self._apply_tool_upgrade(str(event.get("tool_id", "")))
                 elif kind == "unit":
                     self._spawn_unit_from_building(building, str(event.get("unit_class", "worker")))
@@ -2519,14 +3296,15 @@ class Game:
             spawn_wx,
             spawn_wy,
             civilization=building.civilization,
+            kingdom_id=building.kingdom_id,
             unit_class=unit_class,
         )
         self._apply_unit_age_bonus(unit)
         self.units.append(unit)
         self._unit_by_uid[int(unit.uid)] = unit
-        if building.civilization == self.player_civilization:
+        if self._is_player_owned(building):
             self.sound.play("train")
-        if self._network_enabled and building.civilization == self.player_civilization:
+        if self._network_enabled and self._is_player_owned(building):
             self._net_send_spawn_unit(unit)
 
     def _spawn_ship_from_building(self, building: Building) -> None:
@@ -2535,12 +3313,12 @@ class Game:
         water = self._nearest_water_world(building.world_pos.x, building.world_pos.y, max_radius=7)
         if water is None:
             return
-        ship = Ship(water[0], water[1], civilization=building.civilization)
+        ship = Ship(water[0], water[1], civilization=building.civilization, kingdom_id=building.kingdom_id)
         self.ships.append(ship)
         self._ship_by_sid[int(ship.sid)] = ship
-        if building.civilization == self.player_civilization:
+        if self._is_player_owned(building):
             self.sound.play("train")
-        if self._network_enabled and building.civilization == self.player_civilization:
+        if self._network_enabled and self._is_player_owned(building):
             self._net_send_spawn_ship(ship)
 
     def _find_spawn_world_near(
@@ -2606,10 +3384,10 @@ class Game:
                 break
             ax, ay = b.spawn_anchor()
             wx, wy = self._find_spawn_world_near(ax, ay)
-            unit = Unit(wx, wy, civilization=b.civilization, unit_class=Unit.ROLE_ARCHER)
+            unit = Unit(wx, wy, civilization=b.civilization, kingdom_id=b.kingdom_id, unit_class=Unit.ROLE_ARCHER)
             self.units.append(unit)
             self._unit_by_uid[int(unit.uid)] = unit
-            if self._network_enabled and b.civilization == self.player_civilization:
+            if self._network_enabled and self._is_player_owned(b):
                 self._net_send_spawn_unit(unit)
 
     def _update_storage_capacity(self) -> None:
@@ -2617,7 +3395,7 @@ class Game:
         for b in self.buildings:
             if b.is_dead:
                 continue
-            if b.civilization != self.player_civilization:
+            if not self._is_player_owned(b):
                 continue
             bonus = b.storage_bonus
             if bonus <= 0:
@@ -2628,14 +3406,14 @@ class Game:
 
     # ── Selection helpers ─────────────────────────────────────────────────────
     def _select(self, unit: Unit) -> None:
-        if unit.is_dead or unit.civilization != self.player_civilization:
+        if unit.is_dead or unit.kingdom_id != self.player_kingdom_id:
             return
         if unit not in self._selected:
             unit.selected = True
             self._selected.append(unit)
 
     def _select_ship(self, ship: Ship) -> None:
-        if ship.civilization != self.player_civilization:
+        if ship.kingdom_id != self.player_kingdom_id:
             return
         if ship not in self._selected_ships:
             ship.selected = True
@@ -2660,7 +3438,7 @@ class Game:
         self._selected_node = None
         self._deselect_ships()
         for u in self.units:
-            if u.civilization == self.player_civilization and not u.is_dead:
+            if u.kingdom_id == self.player_kingdom_id and not u.is_dead:
                 self._select(u)
 
     def _select_building(self, building: Building) -> None:
@@ -2763,18 +3541,19 @@ class Game:
             self._desync_alert_s = max(0.0, self._desync_alert_s - dt)
         if self._edge_scroll_lock_s > 0.0:
             self._edge_scroll_lock_s = max(0.0, self._edge_scroll_lock_s - dt)
+        self._update_hero_mode(dt, keys)
         allow_edge_scroll = self._edge_scroll_lock_s <= 0.0 and self._is_edge_scroll_allowed()
-        self.camera.update(dt, keys, allow_edge_scroll=allow_edge_scroll)
+        self.camera.update(dt, keys, allow_edge_scroll=allow_edge_scroll, allow_keyboard_scroll=not self._hero_mode)
 
         player_unit_hp_before = {
             int(u.uid): float(u.hp)
             for u in self.units
-            if (not u.is_dead and u.civilization == self.player_civilization)
+            if (not u.is_dead and u.kingdom_id == self.player_kingdom_id)
         }
         player_build_hp_before = {
             id(b): float(b.hp)
             for b in self.buildings
-            if (not b.is_dead and b.civilization == self.player_civilization)
+            if (not b.is_dead and b.kingdom_id == self.player_kingdom_id)
         }
 
         self.resource_manager.update(dt, self.tilemap, blocked_tiles=self._building_blocked_tiles)
@@ -2798,10 +3577,10 @@ class Game:
                     node = event.get("node")
                     amount = int(event.get("amount", 0))
                     if node is not None and amount > 0:
-                        if unit.civilization == self.player_civilization and unit.can_gather:
+                        if unit.kingdom_id == self.player_kingdom_id and unit.can_gather:
                             self._handle_worker_gather_event(unit, node, amount)
-                        elif unit.civilization in self._ai_by_civ:
-                            self._ai_by_civ[unit.civilization].handle_gather(node, amount)
+                        elif unit.kingdom_id in self._ai_by_civ:
+                            self._ai_by_civ[unit.kingdom_id].handle_gather(node, amount)
                         else:
                             self.resource_manager.drain_node(node, amount)
                 elif kind == "build":
@@ -2812,18 +3591,17 @@ class Game:
                         if completed:
                             self._update_storage_capacity()
 
-            if unit.civilization == self.player_civilization:
+            if not self._is_chaos_civ(unit.asset_color):
                 unit.tick_hunger(dt * self._soldier_hunger_drain_mult)
                 if unit.needs_food:
-                    if self.resource_manager.consume("food", 1):
-                        unit.feed()
-                    elif self.resource_manager.consume("meat", 1):
+                    if self._kingdom_consume_food(unit.kingdom_id, 1):
                         unit.feed()
 
             if unit.death_finished:
                 to_remove.append(unit)
 
         self._update_worker_haul()
+        self._deliver_ship_cargo_to_capitals()
 
         player_under_attack = False
         for unit in self.units:
@@ -2846,9 +3624,9 @@ class Game:
 
         for civ, new_age in self.tech_tree.update(dt):
             for unit in self.units:
-                if unit.civilization == civ and not unit.is_dead:
+                if unit.kingdom_id == civ and not unit.is_dead:
                     self._apply_unit_age_bonus(unit)
-            if (self._network_enabled or self.replay.is_recording) and civ == self.player_civilization:
+            if (self._network_enabled or self.replay.is_recording) and civ == self.player_kingdom_id:
                 self._net_send_tech_age(new_age)
 
         if to_remove:
@@ -2868,7 +3646,11 @@ class Game:
         dead_buildings = [b for b in self.buildings if b.is_dead]
         if dead_buildings:
             self.sound.play("death")
-            enemy_destroyed = sum(1 for b in dead_buildings if b.civilization in self.enemy_civilizations)
+            enemy_destroyed = sum(
+                1
+                for b in dead_buildings
+                if (b.kingdom_id != self.player_kingdom_id and not self._is_chaos_civ(b.asset_color))
+            )
             if enemy_destroyed > 0:
                 self.campaign.on_enemy_building_destroyed(enemy_destroyed)
             for building in dead_buildings:
@@ -2885,12 +3667,12 @@ class Game:
             for b in self.buildings
             if (
                 not b.is_dead
-                and b.civilization == self.player_civilization
+                and b.kingdom_id == self.player_kingdom_id
                 and b.building_type in (Building.TYPE_HOUSE1, Building.TYPE_HOUSE2, Building.TYPE_HOUSE3)
             )
         )
         worker_selected = any(
-            (not u.is_dead and u.civilization == self.player_civilization and u.can_gather)
+            (not u.is_dead and u.kingdom_id == self.player_kingdom_id and u.can_gather)
             for u in self._selected
         )
         self.tutorial.update(worker_selected=worker_selected, current_house_count=houses)
@@ -2903,9 +3685,21 @@ class Game:
         if self._civ_sync_timer_s <= 0.0:
             self._civ_sync_timer_s = 0.35
             self._sync_civilizations()
+        self._political_tick_timer_s -= dt
+        if self._political_tick_timer_s <= 0.0:
+            self._political_tick_timer_s += POLITICAL_TICK_S
+            self._update_political_simulation(POLITICAL_TICK_S)
+        self._upkeep_tick_timer_s -= dt
+        if self._upkeep_tick_timer_s <= 0.0:
+            self._upkeep_tick_timer_s += UPKEEP_TICK_S
+            self._update_upkeep_and_loyalty(UPKEEP_TICK_S)
         if self._network_enabled:
             self._reindex_units()
             self._reindex_ships()
+        if self._hero_mode:
+            hero = self._player_hero()
+            if hero is not None:
+                self.camera.center_on_world(hero.world_pos.x, hero.world_pos.y)
         self._check_victory_defeat()
 
     def _update_chaos_factions(self, dt: float) -> None:
@@ -2918,7 +3712,7 @@ class Game:
         self._chaos_state_timer_s = 1.65
 
         chaos_units = [
-            u for u in self.units if (not u.is_dead and self._is_chaos_civ(u.civilization) and u.can_attack)
+            u for u in self.units if (not u.is_dead and self._is_chaos_civ(u.asset_color) and u.can_attack)
         ]
         if not chaos_units:
             return
@@ -2926,7 +3720,7 @@ class Game:
         for unit in chaos_units:
             if unit.attack_target is not None and not unit.attack_target.is_dead:
                 continue
-            enemies = [e for e in self.units if (not e.is_dead and e.civilization != unit.civilization)]
+            enemies = [e for e in self.units if (not e.is_dead and e.kingdom_id != unit.kingdom_id)]
             if enemies:
                 target = min(
                     enemies,
@@ -2939,9 +3733,7 @@ class Game:
                 )
                 continue
 
-            enemy_buildings = [
-                b for b in self.buildings if (not b.is_dead and b.civilization != unit.civilization)
-            ]
+            enemy_buildings = [b for b in self.buildings if (not b.is_dead and b.kingdom_id != unit.kingdom_id)]
             if not enemy_buildings:
                 continue
             target_b = min(
@@ -2955,8 +3747,8 @@ class Game:
             )
 
     def _update_enemy_ai(self) -> None:
-        enemies = [u for u in self.units if (u.civilization != self.player_civilization and not u.is_dead)]
-        friendlies = [u for u in self.units if (u.civilization == self.player_civilization and not u.is_dead)]
+        enemies = [u for u in self.units if (u.kingdom_id != self.player_kingdom_id and not u.is_dead)]
+        friendlies = [u for u in self.units if (u.kingdom_id == self.player_kingdom_id and not u.is_dead)]
         if not enemies or not friendlies:
             return
 
@@ -3110,7 +3902,9 @@ class Game:
             self.camera,
             self.units,
             self.buildings,
-            player_civilization=self.player_civilization,
+            player_civilization=self.player_kingdom_id,
+            player_label=self._kingdom_display_name(self.player_kingdom_id),
+            color_resolver=self._entity_display_color,
         )
         if self.game_result is not None:
             self.hud_ui.draw_endgame(self.screen, self.game_result)
@@ -3157,10 +3951,10 @@ class Game:
 
         fps = self.clock.get_fps()
         friendly_total = sum(
-            1 for unit in self.units if unit.civilization == self.player_civilization and not unit.is_dead
+            1 for unit in self.units if unit.kingdom_id == self.player_kingdom_id and not unit.is_dead
         )
         enemy_total = sum(
-            1 for unit in self.units if unit.civilization != self.player_civilization and not unit.is_dead
+            1 for unit in self.units if unit.kingdom_id != self.player_kingdom_id and not unit.is_dead
         )
         selected_workers = sum(1 for unit in self._selected if unit.can_gather)
         selected_soldiers = sum(1 for unit in self._selected if unit.hunger_enabled)
@@ -3178,9 +3972,11 @@ class Game:
         starving = sum(1 for unit in self.units if unit.starving)
         col_tx, row_tx = self.camera.screen_to_tile(pygame.mouse.get_pos())
         tile = self.tilemap.get_tile(col_tx, row_tx)
-        age_label = self.tech_tree.age_label(self.player_civilization)
-        age_progress = self.tech_tree.research_progress(self.player_civilization)
+        age_label = self.tech_tree.age_label(self.player_kingdom_id)
+        age_progress = self.tech_tree.research_progress(self.player_kingdom_id)
         form_label = self._formation_mode().upper()
+        player_kingdom = self._kingdom(self.player_kingdom_id)
+        capital = self._capital_for_kingdom(self.player_kingdom_id)
 
         if self.ai_controllers:
             state_counts: dict[str, int] = {}
@@ -3217,10 +4013,10 @@ class Game:
         elif self._selected_enemy_unit is not None and not self._selected_enemy_unit.is_dead:
             enemy = self._selected_enemy_unit
             context_line = (
-                f"Dusman {enemy.unit_class.title()} ({enemy.civilization})  "
+                f"Dusman {enemy.unit_class.title()} ({self._kingdom_display_name(enemy.kingdom_id)})  "
                 f"HP {int(enemy.hp)}/{enemy.max_hp}"
             )
-            context_color = (244, 154, 154)
+            context_color = self._entity_display_color(enemy)
         if self._desync_alert_s > 0.0:
             context_line = f"DESYNC algilandi ({self._desync_count}) - yeniden senkronize edildi."
             context_color = (246, 156, 138)
@@ -3229,7 +4025,7 @@ class Game:
 
         tools_active = [tid for tid, active in self._tool_unlocked.items() if active]
         panel_w = 430 if show_full else 320
-        panel_h = 176 if show_full else 76
+        panel_h = 190 if show_full else 76
         if idle_ms > HUD_IDLE_HIDE_MS and not self._hud_pinned:
             panel_h = 54
 
@@ -3263,7 +4059,11 @@ class Game:
         cx += draw_chip(cx, cy, f"Sec {len(self._selected)}/{friendly_total}", (226, 240, 204))
         if show_full:
             cx += draw_chip(cx, cy, f"Isci {selected_workers}", (203, 224, 168))
-            draw_chip(cx, cy, f"Asker {selected_soldiers}", (215, 204, 174))
+            cx += draw_chip(cx, cy, f"Asker {selected_soldiers}", (215, 204, 174))
+            cx += draw_chip(cx, cy, f"Istikrar {int(player_kingdom.stability)}", (166, 220, 172))
+            draw_chip(cx, cy, f"Sadakat {int(player_kingdom.loyalty)}", (198, 190, 234))
+            if self._hero_mode:
+                draw_chip(cx, cy, "Hero Mod", (246, 214, 122))
 
         starving_color = (255, 120, 108) if starving > 0 else (152, 210, 160)
         if panel_h > 70:
@@ -3283,10 +4083,17 @@ class Game:
             self.screen.blit(ctx_surf, (20, 92))
 
         if show_full and panel_h > 130:
+            capital_label = self._kingdom_display_name(self.player_kingdom_id)
+            if capital is not None:
+                cap_line = f"{capital_label}  Bskent HP {int(capital.hp)}/{capital.max_hp}"
+            else:
+                cap_line = f"{capital_label}  Bskent kayip"
+            cap_surf = self.font_xs.render(fit_text(self.font_xs, cap_line, panel_w - 26), True, (232, 224, 172))
+            self.screen.blit(cap_surf, (20, 110))
             help_lines = [
                 "[TAB] Uretici Paneli  [B] Insa  [SagTik] Git/Topla/Saldir",
-                "[1/2/3/4/5] Topla  [Q/W/E/R] Uret  [U] Cikart  [H] Cag Atla",
-                "[F2/F3/F4] Stance  [F5] Formasyon  [F11] Tam Ekran",
+                "[C] Hero Mod  [1/2/3/4/5] Topla  [Q/W/E/R] Uret  [U] Cikart",
+                "[F2/F3/F4] Stance  [F5] Formasyon  [H] Cag Atla  [F11] Tam Ekran",
             ]
             for i, line in enumerate(help_lines):
                 help_surf = self.font_xs.render(
@@ -3294,7 +4101,7 @@ class Game:
                     True,
                     (190, 212, 232),
                 )
-                self.screen.blit(help_surf, (20, 110 + i * 12))
+                self.screen.blit(help_surf, (20, 122 + i * 12))
 
         if tools_active:
             tx = 20
@@ -3385,7 +4192,7 @@ class Game:
             rect = pygame.Rect(bx, by, card_w, card_h)
             is_mode = self._build_mode_type == btype
             costs = Building.build_cost(btype)
-            can_afford = self.resource_manager.can_afford(costs)
+            can_afford = self._kingdom_can_afford(self.player_kingdom_id, costs)
             can_build = self._has_selected_worker()
             enabled = can_afford and can_build
 
@@ -3528,10 +4335,10 @@ class Game:
             required_age = str(option.get("required_age", "dark"))
             age_locked = False
             if required_age in AGE_ORDER:
-                civ_age = self.tech_tree.age(b.civilization)
+                civ_age = self.tech_tree.age(b.kingdom_id)
                 age_locked = AGE_ORDER.index(civ_age) < AGE_ORDER.index(required_age)
             queue_full = b.queue_size >= b.max_queue
-            can_afford = self.resource_manager.can_afford(costs)
+            can_afford = self._kingdom_can_afford(b.kingdom_id, costs)
             enabled = (not locked) and (not age_locked) and can_afford and (not queue_full)
 
             fill = (63, 95, 70) if enabled else (64, 50, 50)
@@ -3631,7 +4438,7 @@ class Game:
         player_castles = [
             b
             for b in self.buildings
-            if (not b.is_dead and b.building_type == Building.TYPE_CASTLE and b.civilization == self.player_civilization)
+            if (not b.is_dead and b.building_type == Building.TYPE_CASTLE and b.kingdom_id == self.player_kingdom_id)
         ]
         enemy_castles = [
             b
@@ -3639,7 +4446,8 @@ class Game:
             if (
                 not b.is_dead
                 and b.building_type == Building.TYPE_CASTLE
-                and b.civilization in self.enemy_civilizations
+                and b.kingdom_id != self.player_kingdom_id
+                and not self._is_chaos_civ(b.asset_color)
             )
         ]
         if not enemy_castles:
@@ -3662,7 +4470,7 @@ class Game:
             return
 
         crowd = self._selected if self._selected else [
-            unit for unit in self.units if unit.civilization == self.player_civilization and not unit.is_dead
+            unit for unit in self.units if unit.kingdom_id == self.player_kingdom_id and not unit.is_dead
         ]
         if not crowd:
             if self._selected_building is not None:

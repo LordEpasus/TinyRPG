@@ -230,6 +230,7 @@ class Unit:
         wx: float,
         wy: float,
         civilization: str = "Blue",
+        kingdom_id: str | None = None,
         unit_class: str = ROLE_WORKER,
     ):
         # Assign a deterministic integer UID (same on host & guest if same seed).
@@ -239,6 +240,8 @@ class Unit:
         self.world_pos = pygame.math.Vector2(wx, wy)
         self.target_pos: pygame.math.Vector2 | None = None
         self.civilization = civilization
+        self.asset_color = civilization
+        self.kingdom_id = kingdom_id or civilization
         self.unit_class = self._normalize_unit_class(unit_class)
 
         self.can_gather = self.unit_class == self.ROLE_WORKER
@@ -253,12 +256,12 @@ class Unit:
         self.attack_range = float(combat["attack_range"])
         self.attack_cooldown = float(combat["attack_cooldown"])
         # Chaos mobs are pressure units; keep them dangerous but not overpowering kingdoms.
-        if self.civilization.startswith("Orc"):
+        if self.asset_color.startswith("Orc"):
             self.max_hp = max(40, int(self.max_hp * 0.80))
             self.hp = float(self.max_hp)
             self.attack *= 0.72
             self.attack_cooldown *= 1.22
-        elif self.civilization.startswith("Slime"):
+        elif self.asset_color.startswith("Slime"):
             self.max_hp = max(36, int(self.max_hp * 0.74))
             self.hp = float(self.max_hp)
             self.attack *= 0.66
@@ -274,7 +277,7 @@ class Unit:
             self.ROLE_ARCHER,
             self.ROLE_LANCER,
         )
-        if self.civilization.startswith("Orc") or self.civilization.startswith("Slime"):
+        if self.asset_color.startswith("Orc") or self.asset_color.startswith("Slime"):
             self.hunger_enabled = False
         self.hunger_s = float(self.HUNGER_MAX_S)
         self.starving = False
@@ -397,21 +400,21 @@ class Unit:
         return self.hunger_s > prev
 
     def is_hostile_to(self, other: "Unit") -> bool:
-        return self.civilization != other.civilization
+        return self.kingdom_id != getattr(other, "kingdom_id", getattr(other, "civilization", self.kingdom_id))
 
     # ── Asset loading ──────────────────────────────────────────────────────────
     def _load_anims(self) -> None:
         ds = self.DISPLAY_SIZE
-        if self.civilization.startswith("Orc"):
+        if self.asset_color.startswith("Orc"):
             self._load_orc_anims(ds)
             self._ensure_dead_anim()
             return
-        if self.civilization.startswith("Slime"):
+        if self.asset_color.startswith("Slime"):
             self._load_slime_anims(ds)
             self._ensure_dead_anim()
             return
 
-        civ_base = os.path.join(TINY_SWORDS, "Units", f"{self.civilization} Units")
+        civ_base = os.path.join(TINY_SWORDS, "Units", f"{self.asset_color} Units")
 
         if self.unit_class in (self.ROLE_HERO, self.ROLE_WARRIOR):
             base = os.path.join(civ_base, "Warrior")
@@ -604,10 +607,10 @@ class Unit:
 
     def _ensure_dead_anim(self) -> None:
         dead_paths = [
-            os.path.join(TINY_SWORDS, "Units", f"{self.civilization} Units", "Tiny_Dead.png"),
+            os.path.join(TINY_SWORDS, "Units", f"{self.asset_color} Units", "Tiny_Dead.png"),
             os.path.join(TINY_SWORDS, "Units", "Tiny_Dead.png"),
         ]
-        if self.civilization.startswith("Orc"):
+        if self.asset_color.startswith("Orc"):
             dead_paths.insert(
                 0,
                 os.path.join(
@@ -737,8 +740,8 @@ class Unit:
             return False
         if getattr(target_unit, "is_dead", False):
             return False
-        target_civ = getattr(target_unit, "civilization", self.civilization)
-        if target_civ == self.civilization:
+        target_kingdom = getattr(target_unit, "kingdom_id", getattr(target_unit, "civilization", self.kingdom_id))
+        if target_kingdom == self.kingdom_id:
             return False
 
         self.stop_gathering()
@@ -1149,7 +1152,7 @@ class Unit:
                 ring_color = GREEN if self.can_gather else YELLOW
                 pygame.draw.ellipse(screen, ring_color, inner, 2)
 
-        show_health = self.selected or self.civilization != self.PLAYER_CIVILIZATION
+        show_health = self.selected or self.kingdom_id != self.PLAYER_CIVILIZATION
         if show_health:
             bar_w = int(44 * zoom)
             bar_h = max(3, int(5 * zoom))

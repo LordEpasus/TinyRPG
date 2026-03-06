@@ -231,12 +231,15 @@ class Building:
         *,
         building_type: str,
         civilization: str = "Blue",
+        kingdom_id: str | None = None,
         max_hp: int = 1600,
         start_progress: float = 1.0,
     ):
         self.world_pos = pygame.math.Vector2(wx, wy)  # bottom-center anchor
         self.building_type = building_type
         self.civilization = civilization
+        self.asset_color = civilization
+        self.kingdom_id = kingdom_id or civilization
         self.selected = False
         self.max_hp = max(1, int(max_hp))
         self.build_time_total = self.construction_time(building_type)
@@ -313,7 +316,7 @@ class Building:
 
     def _load_sprite(self) -> pygame.Surface:
         file_name = self._FILE_BY_TYPE.get(self.building_type, "House1.png")
-        path = os.path.join(TINY_SWORDS, "Buildings", f"{self.civilization} Buildings", file_name)
+        path = os.path.join(TINY_SWORDS, "Buildings", f"{self.asset_color} Buildings", file_name)
         if os.path.exists(path):
             return pygame.image.load(path).convert_alpha()
         fb = pygame.Surface((TILE_SIZE * 2, TILE_SIZE * 2), pygame.SRCALPHA)

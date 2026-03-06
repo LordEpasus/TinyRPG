@@ -44,18 +44,19 @@ class Camera:
                 self._clamp()
 
     # ── Update (keyboard + edge scroll) ──────────────────────────────────────
-    def update(self, dt: float, keys, *, allow_edge_scroll: bool = True) -> None:
+    def update(self, dt: float, keys, *, allow_edge_scroll: bool = True, allow_keyboard_scroll: bool = True) -> None:
         speed = CAM_SPEED * dt / self.zoom
         moved = False
 
-        if keys[pygame.K_a] or keys[pygame.K_LEFT]:
-            self.offset.x -= speed; moved = True
-        if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
-            self.offset.x += speed; moved = True
-        if keys[pygame.K_w] or keys[pygame.K_UP]:
-            self.offset.y -= speed; moved = True
-        if keys[pygame.K_s] or keys[pygame.K_DOWN]:
-            self.offset.y += speed; moved = True
+        if allow_keyboard_scroll:
+            if keys[pygame.K_a] or keys[pygame.K_LEFT]:
+                self.offset.x -= speed; moved = True
+            if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
+                self.offset.x += speed; moved = True
+            if keys[pygame.K_w] or keys[pygame.K_UP]:
+                self.offset.y -= speed; moved = True
+            if keys[pygame.K_s] or keys[pygame.K_DOWN]:
+                self.offset.y += speed; moved = True
 
         if CAM_EDGE_SCROLL and allow_edge_scroll and self._drag is None:
             sw, sh = self._screen_size()

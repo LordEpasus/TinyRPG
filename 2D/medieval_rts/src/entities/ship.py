@@ -21,11 +21,13 @@ class Ship:
     DISPLAY_H = 108
     _sid_seq = 0
 
-    def __init__(self, wx: float, wy: float, *, civilization: str = "Blue"):
+    def __init__(self, wx: float, wy: float, *, civilization: str = "Blue", kingdom_id: str | None = None):
         Ship._sid_seq += 1
         self.sid = Ship._sid_seq
         self.world_pos = pygame.math.Vector2(wx, wy)
         self.civilization = civilization
+        self.asset_color = civilization
+        self.kingdom_id = kingdom_id or civilization
         self.selected = False
         self.max_hp = 520
         self.hp = float(self.max_hp)

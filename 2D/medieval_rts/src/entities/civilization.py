@@ -10,10 +10,33 @@ if TYPE_CHECKING:
 
 @dataclass
 class Civilization:
-    color: str
-    resources: dict[str, int] = field(default_factory=lambda: {"gold": 0, "wood": 0, "stone": 0})
+    kingdom_id: str
+    asset_color: str
+    display_name: str = ""
+    parent_kingdom_id: str | None = None
+    ruler_unit_id: int | None = None
+    capital_building_id: int | None = None
+    stability: float = 78.0
+    loyalty: float = 82.0
+    capital_stockpile: dict[str, int] = field(
+        default_factory=lambda: {"gold": 0, "wood": 0, "stone": 0, "food": 0, "meat": 0}
+    )
+    resources: dict[str, int] = field(
+        default_factory=lambda: {"gold": 0, "wood": 0, "stone": 0, "food": 0, "meat": 0}
+    )
+    upkeep_pressure: float = 0.0
+    food_upkeep_progress: float = 0.0
+    gold_upkeep_progress: float = 0.0
+    split_cooldown: float = 0.0
+    is_major: bool = True
+    crest: str = ""
+    display_color: tuple[int, int, int] = (200, 200, 200)
     units: list["Unit"] = field(default_factory=list)
     buildings: list["Building"] = field(default_factory=list)
+
+    @property
+    def color(self) -> str:
+        return self.asset_color
 
     def add_unit(self, unit: "Unit") -> None:
         if unit not in self.units:
@@ -34,13 +57,14 @@ class Civilization:
     def cleanup(self) -> None:
         self.units = [u for u in self.units if not getattr(u, "is_dead", False)]
         self.buildings = [b for b in self.buildings if not getattr(b, "is_dead", False)]
+        self.split_cooldown = max(0.0, float(self.split_cooldown))
 
     def can_afford(self, costs: dict[str, int]) -> bool:
         for key, amount in costs.items():
             val = int(amount)
             if val <= 0:
                 continue
-            if self.resources.get(key, 0) < val:
+            if self.capital_stockpile.get(key, 0) < val:
                 return False
         return True
 
@@ -50,11 +74,30 @@ class Civilization:
         for key, amount in costs.items():
             val = int(amount)
             if val > 0:
-                self.resources[key] = max(0, self.resources.get(key, 0) - val)
+                self.capital_stockpile[key] = max(0, self.capital_stockpile.get(key, 0) - val)
+                self.resources[key] = self.capital_stockpile[key]
         return True
 
     def gain(self, resource_type: str, amount: int) -> int:
         if amount <= 0:
             return 0
-        self.resources[resource_type] = self.resources.get(resource_type, 0) + int(amount)
+        self.capital_stockpile[resource_type] = self.capital_stockpile.get(resource_type, 0) + int(amount)
+        self.resources[resource_type] = self.capital_stockpile[resource_type]
         return int(amount)
+
+    def set_stockpile(self, payload: dict[str, int]) -> None:
+        for key in ("gold", "wood", "stone", "food", "meat"):
+            self.capital_stockpile[key] = int(payload.get(key, self.capital_stockpile.get(key, 0)))
+            self.resources[key] = self.capital_stockpile[key]
+
+    def consume_food(self, amount: int = 1) -> bool:
+        need = max(1, int(amount))
+        if self.capital_stockpile.get("food", 0) >= need:
+            self.capital_stockpile["food"] -= need
+            self.resources["food"] = self.capital_stockpile["food"]
+            return True
+        if self.capital_stockpile.get("meat", 0) >= need:
+            self.capital_stockpile["meat"] -= need
+            self.resources["meat"] = self.capital_stockpile["meat"]
+            return True
+        return False
