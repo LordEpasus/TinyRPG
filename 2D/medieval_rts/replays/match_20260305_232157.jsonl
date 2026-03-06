@@ -1,0 +1,2 @@
+{"type":"meta","seed":183359232,"player_civilization":"Blue","scenario":"campaign","campaign_mission":1}
+{"type":"event","tick":1011,"msg":{"type":"build","civ":"Blue","building":"house2","tx":24,"ty":25,"protocol":3}}

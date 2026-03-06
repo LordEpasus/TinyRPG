@@ -1,0 +1,23 @@
+# Keep this monorepo focused on the RTS project for GitHub sync/release.
+*
+!.gitignore
+!.github/
+.github/*
+!.github/workflows/
+!.github/workflows/**
+!2D/
+2D/*
+!2D/medieval_rts/
+!2D/medieval_rts/**
+
+# Project-specific ignores
+2D/medieval_rts/.DS_Store
+2D/medieval_rts/**/.DS_Store
+2D/medieval_rts/**/__pycache__/
+2D/medieval_rts/.pytest_cache/
+2D/medieval_rts/build/
+2D/medieval_rts/dist/
+2D/medieval_rts/release/
+2D/medieval_rts/replays/*.json
+2D/medieval_rts/replays/*.rpl
+2D/medieval_rts/*.spec
