@@ -2,7 +2,7 @@
 
 Bu proje iki yoldan dagitiliyor:
 - Gelistirme ekibi: GitHub uzerinden `clone` ve `pull`
-- Oyuncular: GitHub Releases uzerinden hazir Windows `.exe` zip
+- Oyuncular: GitHub Releases uzerinden hazir Windows paketini indirir
 
 ## Hizli komutlar
 
@@ -52,14 +52,22 @@ python scripts/build_windows_exe.py --clean
 Uretilen cikti:
 - `2D/medieval_rts/release/MedievalKingdomsRTS-win64.zip`
 
+Zip icinde:
+- `MedievalKingdomsRTS.exe` -> launcher / auto updater
+- `runtime/` -> asil oyun dosyalari
+- `version.txt` -> paket surumu
+
 ### 5) GitHub Release cikar
 
-`main` branch guncel olduktan sonra sadece tag push etmemiz yeterli:
+`main` branch guncel olduktan sonra surumu guncelleyip tag push etmemiz yeterli:
 
 ```bash
 cd TinyRPG
 git checkout main
 git pull origin main
+cd 2D/medieval_rts
+# version.py icindeki VERSION degerini artir
+cd ../..
 git tag v0.1.0
 git push origin main --tags
 ```
@@ -82,7 +90,8 @@ git pull origin main
 - GitHub repo icindeki **Releases** sayfasina girer.
 - Son surum `MedievalKingdomsRTS-win64.zip` dosyasini indirir.
 - Zip'i acip `MedievalKingdomsRTS.exe` dosyasini calistirir.
-- Yeni surum gelince tekrar son release'i indirir.
+- Launcher acilista GitHub latest release kontrolu yapar.
+- Yeni surum varsa indirip dosyalari gunceller ve oyunu tekrar baslatir.
 
 ## Not
 

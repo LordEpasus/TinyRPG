@@ -6,6 +6,7 @@ import pygame
 
 from settings import FLARE_SPRITES, TITLE
 from src.ui.display import toggle_fullscreen
+from version import VERSION
 
 
 class MainMenu:
@@ -134,6 +135,8 @@ class MainMenu:
             (52, 52, 52),
         )
         screen.blit(hint, (px + (panel_w - hint.get_width()) // 2, py + panel_h - 42))
+        version_label = self.font_hint.render(f"v{VERSION}", True, (84, 84, 84))
+        screen.blit(version_label, (px + panel_w - version_label.get_width() - 18, py + panel_h - 42))
 
     def _draw_button(self, screen: pygame.Surface, rect: pygame.Rect, text: str, *, selected: bool, hovered: bool) -> None:
         flare_btn = self._scaled_flare_button(rect.width, rect.height)

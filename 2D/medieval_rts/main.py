@@ -11,12 +11,13 @@ from src.ui.graphics_menu import GraphicsMenu
 from src.ui.menu import MainMenu
 from src.ui.multiplayer_menu import MultiplayerMenu
 from src.systems.replay import ReplayManager
+from version import VERSION
 
 
 def main() -> None:
     pygame.init()
     screen = apply_display_mode(fullscreen=FULLSCREEN_DEFAULT)
-    pygame.display.set_caption(TITLE)
+    pygame.display.set_caption(f"{TITLE} v{VERSION}")
     clock = pygame.time.Clock()
     menu = MainMenu()
     civ_select = CivilizationSelectScreen()
@@ -37,7 +38,7 @@ def main() -> None:
             screen = ensure_display_surface()
             g_action = graphics_menu.run(screen, clock)
             screen = ensure_display_surface()
-            pygame.display.set_caption(TITLE)
+            pygame.display.set_caption(f"{TITLE} v{VERSION}")
             if g_action == GraphicsMenu.ACTION_EXIT:
                 running = False
                 break
@@ -49,7 +50,7 @@ def main() -> None:
                 continue
             Game(player_civilization=civ, scenario="tutorial", replay_mode=ReplayManager.MODE_RECORD).run()
             screen = ensure_display_surface()
-            pygame.display.set_caption(TITLE)
+            pygame.display.set_caption(f"{TITLE} v{VERSION}")
             continue
         if action == MainMenu.ACTION_CAMPAIGN:
             choice = campaign_menu.run(screen, clock)
@@ -70,7 +71,7 @@ def main() -> None:
                 replay_mode=ReplayManager.MODE_RECORD,
             ).run()
             screen = ensure_display_surface()
-            pygame.display.set_caption(TITLE)
+            pygame.display.set_caption(f"{TITLE} v{VERSION}")
             continue
         if action == MainMenu.ACTION_REPLAY:
             replay_path = ReplayManager.latest_replay_file(replay_dir)
@@ -90,7 +91,7 @@ def main() -> None:
                 replay_path=replay_path,
             ).run()
             screen = ensure_display_surface()
-            pygame.display.set_caption(TITLE)
+            pygame.display.set_caption(f"{TITLE} v{VERSION}")
             continue
         if action == MainMenu.ACTION_MULTIPLAYER:
             mp = multiplayer_menu.run(screen, clock)
@@ -110,7 +111,7 @@ def main() -> None:
                 if mp.server is not None:
                     mp.server.stop()
             screen = ensure_display_surface()
-            pygame.display.set_caption(TITLE)
+            pygame.display.set_caption(f"{TITLE} v{VERSION}")
             continue
 
         civ = civ_select.run(screen, clock)
@@ -119,7 +120,7 @@ def main() -> None:
             continue
         Game(player_civilization=civ).run()
         screen = ensure_display_surface()
-        pygame.display.set_caption(TITLE)
+        pygame.display.set_caption(f"{TITLE} v{VERSION}")
 
     pygame.quit()
 
