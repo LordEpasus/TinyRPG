@@ -1,31 +1,36 @@
-# Medieval Kingdoms RTS - GitHub + EXE dagitim akisi
+# Medieval Kingdoms RTS - GitHub ve EXE dagitim akisi
 
-Bu proje artik su sekilde dagitilabilir:
-- Gelistirme: GitHub repo uzerinden `git pull`
-- Oyuncu dagitimi: GitHub Releases uzerinden Windows `.exe` zip
+Bu proje iki yoldan dagitiliyor:
+- Gelistirme ekibi: GitHub uzerinden `clone` ve `pull`
+- Oyuncular: GitHub Releases uzerinden hazir Windows `.exe` zip
 
-## 1) Ilk kurulum (developer)
+## Hizli komutlar
 
-Repo koku: `/Users/mustafasalepci/Projeler`
+### 1) Sifirdan klonla
 
 ```bash
-cd /Users/mustafasalepci/Projeler
-# ilk defa remote eklemek icin
-# git remote add origin <GITHUB_REPO_URL>
+git clone https://github.com/LordEpasus/TinyRPG.git
+cd TinyRPG
+git checkout main
 ```
 
-Bu repoda sadece `2D/medieval_rts` ve `.github/workflows` takip edilecek sekilde `.gitignore` ayarlandi.
-
-## 2) Vendor assetleri proje icine cek (exe icin zorunlu)
-
-`settings.py`, once `assets/vendor2d` klasorunu arar. Varsa buradan calisir.
+### 2) Guncel kodu cek
 
 ```bash
-cd /Users/mustafasalepci/Projeler/2D/medieval_rts
+cd TinyRPG
+git pull origin main
+```
+
+### 3) Vendor assetleri projeye kopyala
+
+`settings.py` once `assets/vendor2d` klasorunu arar. EXE build oncesi bu klasorun dolu olmasi gerekir.
+
+```bash
+cd TinyRPG/2D/medieval_rts
 python3 scripts/sync_vendor_assets.py --clean
 ```
 
-Bu komut asagidaki dis paketleri `assets/vendor2d/` altina kopyalar:
+Bu komut su paketleri `assets/vendor2d/` altina toplar:
 - Tiny Swords (Free Pack)
 - mystic_woods_free_2
 - Pixel Art Top Down - Basic v1
@@ -33,45 +38,52 @@ Bu komut asagidaki dis paketleri `assets/vendor2d/` altina kopyalar:
 - Tiny RPG Character Asset Pack v1.03 -Free Soldier&Orc
 - Ship_full.png
 
-## 3) Lokal Windows exe build
+### 4) Lokal Windows EXE build
 
-Windows'ta:
+Windows tarafinda:
 
 ```powershell
-cd 2D/medieval_rts
+cd TinyRPG\2D\medieval_rts
 python -m pip install -r requirements.txt
 python -m pip install pyinstaller
 python scripts/build_windows_exe.py --clean
 ```
 
-Cikti:
+Uretilen cikti:
 - `2D/medieval_rts/release/MedievalKingdomsRTS-win64.zip`
 
-## 4) Otomatik GitHub Release
+### 5) GitHub Release cikar
 
-Tag push yapildiginda GitHub Actions otomatik build + release yapar:
+`main` branch guncel olduktan sonra sadece tag push etmemiz yeterli:
 
 ```bash
-cd /Users/mustafasalepci/Projeler
+cd TinyRPG
+git checkout main
+git pull origin main
 git tag v0.1.0
-git push origin master --tags
+git push origin main --tags
 ```
 
 Workflow dosyasi:
 - `.github/workflows/medieval-rts-release.yml`
 
-## 5) Arkadaslar guncelleme nasil alacak?
+Bu workflow Windows runner acip zip dosyasini otomatik release olarak yukler.
 
-### A) Gelistirici arkadaslar
+## Arkadaslar nasil gunceller?
+
+### Gelistirici arkadaslar
+
 ```bash
-git pull
+git pull origin main
 ```
 
-### B) Oyuncu arkadaslar
-- GitHub repo > **Releases** > son surum `MedievalKingdomsRTS-win64.zip`
-- Zip'i indirip acar, `MedievalKingdomsRTS.exe` calistirir.
-- Yeni surumde tekrar latest release indirir.
+### Oyuncu arkadaslar
 
----
+- GitHub repo icindeki **Releases** sayfasina girer.
+- Son surum `MedievalKingdomsRTS-win64.zip` dosyasini indirir.
+- Zip'i acip `MedievalKingdomsRTS.exe` dosyasini calistirir.
+- Yeni surum gelince tekrar son release'i indirir.
 
-Istersen bir sonraki adimda otomatik "in-game update checker" da ekleriz (GitHub latest release API kontrolu).
+## Not
+
+Bu monorepo icinde Git tarafinda yalnizca `2D/medieval_rts` ve `.github/workflows` takip edilecek sekilde kok `.gitignore` ayarlanmistir.
