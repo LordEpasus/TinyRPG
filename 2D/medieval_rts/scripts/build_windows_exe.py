@@ -55,6 +55,68 @@ def maybe_build_icon(project_root: Path) -> Path | None:
     return icon_path
 
 
+def maybe_build_installer_theme(project_root: Path) -> tuple[Path | None, Path | None]:
+    try:
+        from PIL import Image, ImageColor, ImageDraw, ImageOps
+    except Exception:
+        print("[warn] Pillow not found, installer theme skipped")
+        return None, None
+
+    build_dir = project_root / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    wizard_path = build_dir / "installer_wizard.bmp"
+    banner_path = build_dir / "installer_banner.bmp"
+
+    tiny_root = project_root / "assets" / "vendor2d" / "Tiny Swords (Free Pack)" / "UI Elements" / "UI Elements"
+    banner_src = tiny_root / "Banners" / "Banner.png"
+    paper_src = tiny_root / "Papers" / "RegularPaper.png"
+    wood_src = tiny_root / "Wood Table" / "WoodTable.png"
+    castle_src = project_root / "assets" / "icons" / "png" / "castle.png"
+
+    wizard = Image.new("RGB", (164, 314), ImageColor.getrgb("#0f1b2b"))
+    draw = ImageDraw.Draw(wizard)
+    for y in range(wizard.height):
+        blend = y / max(1, wizard.height - 1)
+        r = int(15 + (47 - 15) * blend)
+        g = int(27 + (36 - 27) * blend)
+        b = int(43 + (52 - 43) * blend)
+        draw.line((0, y, wizard.width, y), fill=(r, g, b))
+    draw.rectangle((10, 10, 154, 304), outline=(191, 157, 107), width=2)
+
+    if wood_src.exists():
+        with Image.open(wood_src) as wood:
+            wood = ImageOps.fit(wood.convert("RGBA"), (124, 74))
+            wood.putalpha(136)
+            wizard.paste(wood, (20, 214), wood)
+    if paper_src.exists():
+        with Image.open(paper_src) as paper:
+            paper = ImageOps.fit(paper.convert("RGBA"), (132, 110))
+            wizard.paste(paper, (16, 22), paper)
+    if castle_src.exists():
+        with Image.open(castle_src) as castle:
+            castle = ImageOps.contain(castle.convert("RGBA"), (92, 92))
+            wizard.paste(castle, ((wizard.width - castle.width) // 2, 96), castle)
+    if banner_src.exists():
+        with Image.open(banner_src) as banner:
+            banner = ImageOps.contain(banner.convert("RGBA"), (120, 28))
+            wizard.paste(banner, ((wizard.width - banner.width) // 2, 176), banner)
+
+    draw.text((24, 188), "Medieval", fill=(245, 236, 214))
+    draw.text((24, 204), "Kingdoms RTS", fill=(245, 236, 214))
+    wizard.save(wizard_path, format="BMP")
+
+    banner = Image.new("RGB", (55, 55), ImageColor.getrgb("#142133"))
+    draw = ImageDraw.Draw(banner)
+    draw.rectangle((0, 0, banner.width - 1, banner.height - 1), outline=(191, 157, 107), width=2)
+    if castle_src.exists():
+        with Image.open(castle_src) as castle:
+            castle = ImageOps.contain(castle.convert("RGBA"), (36, 36))
+            banner.paste(castle, ((banner.width - castle.width) // 2, (banner.height - castle.height) // 2), castle)
+    banner.save(banner_path, format="BMP")
+    return wizard_path, banner_path
+
+
 def ensure_vendor_assets(project_root: Path) -> None:
     vendor_root = project_root / "assets" / "vendor2d"
     missing: list[str] = []
@@ -159,16 +221,26 @@ def find_iscc() -> Path | None:
     return None
 
 
-def write_inno_script(project_root: Path, package_dir: Path, app_name: str, icon_path: Path | None) -> Path:
+def write_inno_script(
+    project_root: Path,
+    package_dir: Path,
+    app_name: str,
+    icon_path: Path | None,
+    wizard_image: Path | None,
+    banner_image: Path | None,
+) -> Path:
     build_dir = project_root / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
     script_path = build_dir / "windows_installer.iss"
     icon_line = f'SetupIconFile={icon_path.as_posix()}' if icon_path is not None else ""
+    wizard_line = f'WizardImageFile={wizard_image.as_posix()}' if wizard_image is not None else ""
+    banner_line = f'WizardSmallImageFile={banner_image.as_posix()}' if banner_image is not None else ""
     script = textwrap.dedent(
         f"""\
         [Setup]
         AppId=LordEpasus.MedievalKingdomsRTS
         AppName={app_name}
+        AppVerName={app_name} v{VERSION}
         AppVersion={VERSION}
         AppPublisher=LordEpasus
         DefaultDirName={{localappdata}}\\Programs\\{app_name}
@@ -183,7 +255,13 @@ def write_inno_script(project_root: Path, package_dir: Path, app_name: str, icon
         Compression=lzma
         SolidCompression=yes
         WizardStyle=modern
+        WizardResizable=no
+        {wizard_line}
+        {banner_line}
         {icon_line}
+
+        [Languages]
+        Name: "turkish"; MessagesFile: "compiler:Languages\\Turkish.isl"
 
         [Tasks]
         Name: "desktopicon"; Description: "Masaustu kisayolu olustur"; Flags: unchecked
@@ -207,7 +285,8 @@ def build_windows_installer(project_root: Path, package_dir: Path, app_name: str
     iscc = find_iscc()
     if iscc is None:
         raise SystemExit("Inno Setup (ISCC.exe) bulunamadi. --installer icin once Inno Setup kurulu olmali.")
-    script_path = write_inno_script(project_root, package_dir, app_name, icon_path)
+    wizard_image, banner_image = maybe_build_installer_theme(project_root)
+    script_path = write_inno_script(project_root, package_dir, app_name, icon_path, wizard_image, banner_image)
     run([str(iscc), str(script_path)], cwd=project_root)
     installer_path = project_root / "release" / f"{app_name}-Setup.exe"
     if not installer_path.exists():

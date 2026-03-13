@@ -10,6 +10,7 @@ from settings import (
     CAPITAL_FOOD_MIN_DAYS,
     CAPITAL_GOLD_MIN_DAYS,
     DESERTION_STABILITY_THRESHOLD,
+    DIPLOMACY_TICK_S,
     FPS,
     HUD_FULL_SHOW_MS,
     HUD_IDLE_HIDE_MS,
@@ -19,14 +20,21 @@ from settings import (
     MAX_MAJOR_KINGDOMS,
     MUTINY_STABILITY_THRESHOLD,
     POLITICAL_TICK_S,
+    PROFILER_CAPTURE_SECONDS,
+    PROFILER_ENABLED,
+    PROFILER_HISTORY_FRAMES,
     SPAWN_SAFE_RADIUS,
+    SUPPRESSION_TICK_S,
     TILE_DIRT,
     TILE_GRASS,
     TILE_WATER,
     TILE_SIZE,
+    TREATY_MIN_DURATION_S,
     TINY_SWORDS,
     TITLE,
+    TRIBUTE_INTERVAL_S,
     UPKEEP_TICK_S,
+    WAR_EXHAUSTION_MAX,
     GREEN,
     WHITE,
     YELLOW,
@@ -39,6 +47,8 @@ from src.entities.building import Building
 from src.entities.civilization import Civilization
 from src.entities.ship import Ship
 from src.entities.unit import Unit
+from src.debug.profiler import ProfilerManager
+from src.systems.diplomacy import DiplomacyManager, TreatyState
 from src.systems.resources import ResourceManager
 from src.systems.tech_tree import AGE_ORDER, TechTree
 from src.systems.tutorial import TutorialManager
@@ -144,6 +154,8 @@ class Game:
         self._tree_skip_tiles: set[tuple[int, int]] = set()
         self._kingdom_split_seq = 0
         self._political_tick_timer_s = POLITICAL_TICK_S
+        self._diplomacy_tick_timer_s = DIPLOMACY_TICK_S
+        self._suppression_tick_timer_s = SUPPRESSION_TICK_S
         self._upkeep_tick_timer_s = UPKEEP_TICK_S
         self._hero_mode = False
         self._hero_input_send_s = 0.0
@@ -151,6 +163,7 @@ class Game:
         self._hero_last_attack = False
         self._player_hero_uid = 0
         self._last_stock_broadcast: dict[str, tuple[tuple[str, int], ...]] = {}
+        self._diplomacy_overlay_visible = True
 
         self.camera = Camera()
         self.tilemap = TileMap(
@@ -192,6 +205,12 @@ class Game:
         self.civilizations: dict[str, Civilization] = {}
         self._kingdom_lineages: dict[str, list[str]] = {}
         self._register_major_kingdoms()
+        self.diplomacy = DiplomacyManager(self.map_seed + 19031)
+        self.profiler = ProfilerManager(
+            enabled=PROFILER_ENABLED,
+            history_frames=PROFILER_HISTORY_FRAMES,
+            capture_seconds=PROFILER_CAPTURE_SECONDS,
+        )
 
         self.resource_manager: ResourceManager | None = None
         self._spawn_start_buildings()
@@ -296,12 +315,14 @@ class Game:
                     "scenario": self.scenario,
                     "campaign_mission": int(self.campaign_mission),
                     "kingdom_names": {kid: civ.display_name for kid, civ in self.civilizations.items()},
+                    "kingdom_roster": sorted(self.civilizations.keys()),
                     "spawn_plan": {
                         civ: [round(world[0], 2), round(world[1], 2)] for civ, world in self._civ_spawn_worlds.items()
                     },
                 },
             )
         self._replay_summary = self.replay.summary() if self.replay.is_playback else {}
+        self._update_diplomacy(0.01)
 
         now = pygame.time.get_ticks()
         self._hud_pinned = False
@@ -312,6 +333,7 @@ class Game:
         self.font_md = pygame.font.SysFont("monospace", 15, bold=True)
         self.font_sm = pygame.font.SysFont("monospace", 13)
         self.font_xs = pygame.font.SysFont("monospace", 11)
+        self._hud_text_cache: dict[tuple[int, str, tuple[int, int, int]], pygame.Surface] = {}
         self._ui_unit_icons = self._load_unit_ui_icons()
         self._ui_tool_icons = self._load_tool_icons()
         self._ui_build_icons = self._load_build_icons()
@@ -785,7 +807,13 @@ class Game:
         return self._entity_kingdom_id(left) == self._entity_kingdom_id(right)
 
     def _is_hostile_entity(self, left, right) -> bool:
-        return self._entity_kingdom_id(left) != self._entity_kingdom_id(right)
+        left_id = self._entity_kingdom_id(left)
+        right_id = self._entity_kingdom_id(right)
+        if left_id == right_id:
+            return False
+        if self._is_chaos_civ(self._entity_asset_color(left)) or self._is_chaos_civ(self._entity_asset_color(right)):
+            return True
+        return self.diplomacy.is_hostile(left_id, right_id)
 
     def _player_hero(self) -> Unit | None:
         hero = self._unit_from_uid(self._player_hero_uid)
@@ -861,6 +889,7 @@ class Game:
             if ctrl is None:
                 continue
             self._sync_ai_resource_cache(civ_key)
+        self.diplomacy.ensure_roster(self._active_civilized_kingdom_ids())
 
     def _spawn_enemy_units(self) -> None:
         # Backward-compatible hook for all AI factions.
@@ -908,6 +937,47 @@ class Game:
                 "reason": reason,
             }
         )
+
+    def _net_send_treaty_change(self, payload: dict[str, object]) -> None:
+        left = str(payload.get("left", ""))
+        if not left or not self._should_broadcast_kingdom_state(left):
+            return
+        rel_payload = dict(payload)
+        rel_payload.setdefault("type", protocol.MSG_TREATY_CHANGE)
+        self._net_send(rel_payload)
+
+    def _net_send_tribute_paid(self, payload: dict[str, object]) -> None:
+        payer = str(payload.get("from", ""))
+        if not payer or not self._should_broadcast_kingdom_state(payer):
+            return
+        msg = dict(payload)
+        msg.setdefault("type", protocol.MSG_TRIBUTE_PAID)
+        self._net_send(msg)
+
+    def _net_send_diplomacy_state(self) -> None:
+        if self._network_enabled and self.player_id != 0:
+            return
+        payload = {
+            "type": protocol.MSG_DIPLOMACY_STATE,
+            "civ": self.player_civilization,
+            "kingdom_id": self.player_kingdom_id,
+            "state": self.diplomacy.serialize(),
+        }
+        self._net_send(payload)
+
+    def _broadcast_diplomacy_updates(self, *, force_full: bool) -> None:
+        for item in self.diplomacy.consume_recent_changes():
+            self._net_send_treaty_change(item)
+        for item in self.diplomacy.consume_recent_tributes():
+            self._net_send_tribute_paid(item)
+            payer = str(item.get("from", ""))
+            receiver = str(item.get("to", ""))
+            if payer:
+                self._net_send_capital_stock(payer, reason="tribute", force=True)
+            if receiver:
+                self._net_send_capital_stock(receiver, reason="tribute", force=True)
+        if force_full:
+            self._net_send_diplomacy_state()
 
     def _kingdom_spend(self, kingdom_id: str, costs: dict[str, int]) -> bool:
         ok = self._kingdom(kingdom_id).spend(costs)
@@ -1029,6 +1099,11 @@ class Game:
             protocol.MSG_FORMATION_SET,
             protocol.MSG_KINGDOM_SPLIT,
             protocol.MSG_CAPITAL_STOCK,
+            protocol.MSG_DIPLOMACY_STATE,
+            protocol.MSG_TREATY_CHANGE,
+            protocol.MSG_TRIBUTE_PAID,
+            protocol.MSG_SUPPRESSION_ORDER,
+            protocol.MSG_NAVAL_TASK,
             protocol.MSG_TECH_START,
             protocol.MSG_TECH_AGE,
         }
@@ -1431,6 +1506,38 @@ class Game:
                     self._sync_player_resource_manager()
             return
 
+        if msg_type == protocol.MSG_DIPLOMACY_STATE:
+            state = msg.get("state", {})
+            if isinstance(state, dict):
+                self.diplomacy.apply_serialized(state)
+            return
+
+        if msg_type == protocol.MSG_TREATY_CHANGE:
+            left = str(msg.get("left", ""))
+            right = str(msg.get("right", ""))
+            if left and right:
+                rel = self.diplomacy.relation(left, right)
+                rel.state = str(msg.get("state", rel.state))
+                rel.last_reason = str(msg.get("reason", rel.last_reason))
+                rel.last_change_tick = int(msg.get("tick", rel.last_change_tick))
+                rel.tribute_from = str(msg.get("tribute_from", rel.tribute_from))
+                rel.tribute_to = str(msg.get("tribute_to", rel.tribute_to))
+                rel.truce_until_s = float(msg.get("truce_until_s", rel.truce_until_s))
+            return
+
+        if msg_type == protocol.MSG_TRIBUTE_PAID:
+            payer = str(msg.get("from", ""))
+            receiver = str(msg.get("to", ""))
+            if payer and receiver:
+                self._sync_ai_resource_cache(payer)
+                self._sync_ai_resource_cache(receiver)
+                if payer == self.player_kingdom_id or receiver == self.player_kingdom_id:
+                    self._sync_player_resource_manager()
+            return
+
+        if msg_type in (protocol.MSG_SUPPRESSION_ORDER, protocol.MSG_NAVAL_TASK):
+            return
+
     def _process_network_messages(self) -> None:
         if not self._network_enabled or self.net is None:
             return
@@ -1538,6 +1645,12 @@ class Game:
                 round(float(civ.stability), 2),
                 round(float(civ.loyalty), 2),
                 round(float(civ.split_cooldown), 2),
+                round(float(civ.war_exhaustion), 2),
+                round(float(civ.tribute_balance), 2),
+                round(float(civ.suppression_priority), 2),
+                round(float(civ.naval_intent), 2),
+                civ.stance_bias,
+                round(float(civ.capital_risk), 2),
                 round(float(civ.food_upkeep_progress), 3),
                 round(float(civ.gold_upkeep_progress), 3),
                 tuple(sorted((k, int(v)) for k, v in civ.capital_stockpile.items())),
@@ -1548,7 +1661,8 @@ class Game:
             for kid, civ in self.civilizations.items()
         ]
         kingdom_blob.sort(key=lambda item: item[0])
-        payload = f"{unit_blob}|{build_blob}|{ship_blob}|{kingdom_blob}|{self.tech_tree.serialize()}"
+        diplomacy_blob = self.diplomacy.serialize()
+        payload = f"{unit_blob}|{build_blob}|{ship_blob}|{kingdom_blob}|{diplomacy_blob}|{self.tech_tree.serialize()}"
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
     def _serialize_sync_state(self) -> dict[str, object]:
@@ -1604,6 +1718,13 @@ class Game:
                     "stability": float(civ.stability),
                     "loyalty": float(civ.loyalty),
                     "split_cooldown": float(civ.split_cooldown),
+                    "war_exhaustion": float(civ.war_exhaustion),
+                    "tribute_balance": float(civ.tribute_balance),
+                    "suppression_priority": float(civ.suppression_priority),
+                    "naval_intent": float(civ.naval_intent),
+                    "stance_bias": str(civ.stance_bias),
+                    "capital_risk": float(civ.capital_risk),
+                    "relations": dict(civ.relations),
                     "food_upkeep_progress": float(civ.food_upkeep_progress),
                     "gold_upkeep_progress": float(civ.gold_upkeep_progress),
                     "stock": dict(civ.capital_stockpile),
@@ -1615,6 +1736,7 @@ class Game:
                 }
                 for kid, civ in self.civilizations.items()
             },
+            "diplomacy": self.diplomacy.serialize(),
             "tech": self.tech_tree.serialize(),
         }
 
@@ -1623,6 +1745,7 @@ class Game:
         raw_buildings = payload.get("buildings", [])
         raw_ships = payload.get("ships", [])
         raw_kingdoms = payload.get("kingdoms", {})
+        raw_diplomacy = payload.get("diplomacy", {})
         raw_tech = payload.get("tech", {})
 
         if isinstance(raw_tech, dict):
@@ -1639,18 +1762,29 @@ class Game:
                 civ.stability = float(item.get("stability", civ.stability))
                 civ.loyalty = float(item.get("loyalty", civ.loyalty))
                 civ.split_cooldown = float(item.get("split_cooldown", civ.split_cooldown))
+                civ.war_exhaustion = float(item.get("war_exhaustion", civ.war_exhaustion))
+                civ.tribute_balance = float(item.get("tribute_balance", civ.tribute_balance))
+                civ.suppression_priority = float(item.get("suppression_priority", civ.suppression_priority))
+                civ.naval_intent = float(item.get("naval_intent", civ.naval_intent))
+                civ.stance_bias = str(item.get("stance_bias", civ.stance_bias))
+                civ.capital_risk = float(item.get("capital_risk", civ.capital_risk))
                 civ.food_upkeep_progress = float(item.get("food_upkeep_progress", civ.food_upkeep_progress))
                 civ.gold_upkeep_progress = float(item.get("gold_upkeep_progress", civ.gold_upkeep_progress))
                 civ.ruler_unit_id = item.get("ruler_uid") if item.get("ruler_uid") is not None else civ.ruler_unit_id
                 civ.capital_building_id = item.get("capital_id") if item.get("capital_id") is not None else civ.capital_building_id
                 civ.is_major = bool(item.get("is_major", civ.is_major))
                 civ.crest = str(item.get("crest", civ.crest))
+                relations = item.get("relations", {})
+                if isinstance(relations, dict):
+                    civ.relations = {str(k): str(v) for k, v in relations.items()}
                 display_color = item.get("display_color")
                 if isinstance(display_color, list) and len(display_color) == 3:
                     civ.display_color = tuple(int(v) for v in display_color)
                 stock = item.get("stock", {})
                 if isinstance(stock, dict):
                     civ.set_stockpile({k: int(v) for k, v in stock.items()})
+        if isinstance(raw_diplomacy, dict):
+            self.diplomacy.apply_serialized(raw_diplomacy)
 
         if isinstance(raw_units, list):
             keep_uids: set[int] = set()
@@ -1862,10 +1996,14 @@ class Game:
         try:
             while self.running:
                 dt = min(self.clock.tick(FPS) / 1000.0, 0.05)
+                self.profiler.begin_frame()
                 keys = pygame.key.get_pressed()
                 self._handle_events(keys)
-                self._update(dt, keys)
-                self._draw()
+                with self.profiler.section("update_ms"):
+                    self._update(dt, keys)
+                with self.profiler.section("render_ms"):
+                    self._draw()
+                self.profiler.end_frame(dt)
         finally:
             self._notify_network_exit()
             self.replay.close()
@@ -1912,6 +2050,12 @@ class Game:
                     if event.key == pygame.K_F1:
                         self._hud_pinned = not self._hud_pinned
                         self._mark_activity()
+                    elif event.key == pygame.K_F8:
+                        self.profiler.toggle_overlay()
+                    elif event.key == pygame.K_F9:
+                        self.profiler.toggle_capture()
+                    elif event.key == pygame.K_F10:
+                        self.profiler.finalize_report()
                     continue
                 elif event.key == pygame.K_g:
                     self.show_grid = not self.show_grid
@@ -1945,6 +2089,12 @@ class Game:
                         }
                     )
                     self._mark_activity()
+                elif event.key == pygame.K_F8:
+                    self.profiler.toggle_overlay()
+                elif event.key == pygame.K_F9:
+                    self.profiler.toggle_capture()
+                elif event.key == pygame.K_F10:
+                    self.profiler.finalize_report()
                 elif event.key == pygame.K_h:
                     self._try_age_up_player()
                 elif event.key in (pygame.K_1, pygame.K_KP1):
@@ -2205,13 +2355,22 @@ class Game:
         if hero is None or hero.is_dead:
             return
         wx, wy = self.camera.screen_to_world(pos)
-        enemy = next((u for u in self.units if (not u.is_dead and u.contains_point(wx, wy) and hero.is_hostile_to(u))), None)
+        enemy = next(
+            (
+                u
+                for u in self.units
+                if (not u.is_dead and u.contains_point(wx, wy) and u.kingdom_id != hero.kingdom_id)
+            ),
+            None,
+        )
         if enemy is None:
             enemy_building = next(
                 (b for b in reversed(self.buildings) if (not b.is_dead and b.contains_point(wx, wy) and b.kingdom_id != hero.kingdom_id)),
                 None,
             )
             if enemy_building is not None:
+                self.diplomacy.declare_war(hero.kingdom_id, enemy_building.kingdom_id, tick=self._sync_tick, reason="hero_attack")
+                self._broadcast_diplomacy_updates(force_full=False)
                 hero.attack_command(enemy_building, pathfinder=self.pathfinder, blocked_tiles=self._building_blocked_tiles)
                 self._net_send_unit_attack(hero, enemy_building)
                 self.sound.play("attack")
@@ -2220,6 +2379,8 @@ class Game:
             self._net_send_unit_move(hero, wx, wy)
             self.sound.play("move")
             return
+        self.diplomacy.declare_war(hero.kingdom_id, enemy.kingdom_id, tick=self._sync_tick, reason="hero_attack")
+        self._broadcast_diplomacy_updates(force_full=False)
         hero.attack_command(enemy, pathfinder=self.pathfinder, blocked_tiles=self._building_blocked_tiles)
         self._net_send_unit_attack(hero, enemy)
         self.sound.play("attack")
@@ -2502,7 +2663,7 @@ class Game:
         for unit in self.units:
             if unit.is_dead:
                 continue
-            if not friend.is_hostile_to(unit):
+            if unit.kingdom_id == friend.kingdom_id:
                 continue
             if not unit.contains_point(wx, wy):
                 continue
@@ -2533,6 +2694,10 @@ class Game:
         ]
         if not attackers:
             return
+        target_kingdom = self._entity_kingdom_id(target)
+        if target_kingdom and target_kingdom != self.player_kingdom_id and not self._is_chaos_civ(self._entity_asset_color(target)):
+            self.diplomacy.declare_war(self.player_kingdom_id, target_kingdom, tick=self._sync_tick, reason="player_attack")
+            self._broadcast_diplomacy_updates(force_full=False)
         self._selected_enemy_unit = target if isinstance(target, Unit) else None
         self._selected_node = None
 
@@ -2936,6 +3101,30 @@ class Game:
                 self._sync_player_resource_manager()
             self._net_send_capital_stock(kingdom_id, reason="upkeep")
 
+    def _update_diplomacy(self, dt: float) -> None:
+        self.diplomacy.update(
+            self,
+            dt,
+            tick=self._sync_tick,
+            min_duration_s=TREATY_MIN_DURATION_S,
+            tribute_interval_s=TRIBUTE_INTERVAL_S,
+            war_exhaustion_max=WAR_EXHAUSTION_MAX,
+        )
+        for kingdom_id in self._active_civilized_kingdom_ids():
+            trade_links = len(self.diplomacy.trade_partners_for(kingdom_id))
+            if trade_links > 0:
+                civ = self._kingdom(kingdom_id)
+                civ.capital_stockpile["gold"] = civ.capital_stockpile.get("gold", 0) + trade_links
+                civ.capital_stockpile["food"] = civ.capital_stockpile.get("food", 0) + trade_links
+                civ.resources["gold"] = civ.capital_stockpile["gold"]
+                civ.resources["food"] = civ.capital_stockpile["food"]
+            self._sync_ai_resource_cache(kingdom_id)
+            if kingdom_id == self.player_kingdom_id:
+                self._sync_player_resource_manager()
+            if trade_links > 0:
+                self._net_send_capital_stock(kingdom_id, reason="trade")
+        self._broadcast_diplomacy_updates(force_full=False)
+
     def _update_political_simulation(self, dt: float) -> None:
         for kingdom_id in self._active_civilized_kingdom_ids():
             civ = self._kingdom(kingdom_id)
@@ -2956,6 +3145,9 @@ class Game:
             food_total = civ.capital_stockpile.get("food", 0) + civ.capital_stockpile.get("meat", 0)
             gold_total = civ.capital_stockpile.get("gold", 0)
             food_rate, gold_rate = self._kingdom_upkeep_rates(civ)
+            trade_links = len(self.diplomacy.trade_partners_for(kingdom_id))
+            tribute_info = self.diplomacy.tributary_info_for(kingdom_id)
+            war_targets = self.diplomacy.war_targets_for(kingdom_id)
             food_days = food_total / max(0.25, food_rate * 60.0)
             gold_days = gold_total / max(0.25, gold_rate * 60.0)
 
@@ -2980,6 +3172,15 @@ class Game:
                 delta += 0.10
                 if gold_days > CAPITAL_GOLD_MIN_DAYS + 2.0:
                     delta += 0.05
+            if trade_links > 0:
+                delta += min(0.22, trade_links * 0.08)
+            if war_targets:
+                delta -= min(0.42, len(war_targets) * 0.12)
+                delta -= min(0.48, float(civ.war_exhaustion) * 0.08)
+            if tribute_info is not None and tribute_info[0] == kingdom_id:
+                delta -= 0.20
+            elif tribute_info is not None and tribute_info[1] == kingdom_id:
+                delta += 0.08
             delta -= frontier_units * 0.02
 
             civ.stability = max(0.0, min(100.0, civ.stability + delta))
@@ -3088,6 +3289,7 @@ class Game:
         center_x = sum(unit.world_pos.x for unit in split_units) / len(split_units)
         center_y = sum(unit.world_pos.y for unit in split_units) / len(split_units)
         self._spawn_rebel_ai(child_id, base_world=(center_x, center_y), parent=civ.kingdom_id)
+        self.diplomacy.note_split(civ.kingdom_id, child_id, tick=self._sync_tick, duration_s=TREATY_MIN_DURATION_S)
 
         if self._should_broadcast_kingdom_state(civ.kingdom_id):
             self._net_send(
@@ -3116,6 +3318,7 @@ class Game:
             )
         self._net_send_capital_stock(civ.kingdom_id, reason="split-parent", force=True)
         self._net_send_capital_stock(child_id, reason="split-child", force=True)
+        self._broadcast_diplomacy_updates(force_full=False)
         return True
 
     def _apply_remote_kingdom_split(self, msg: dict[str, object]) -> None:
@@ -3153,6 +3356,7 @@ class Game:
         self._sync_ai_resource_cache(child_id)
         center = self._civ_spawn_worlds.get(parent_id, self._spawn_world)
         self._spawn_rebel_ai(child_id, base_world=center, parent=parent_id)
+        self.diplomacy.note_split(parent_id, child_id, tick=self._sync_tick, duration_s=TREATY_MIN_DURATION_S)
 
     def _spawn_rebel_ai(self, kingdom_id: str, *, base_world: tuple[float, float], parent: str) -> None:
         if kingdom_id in self._ai_by_civ:
@@ -3563,52 +3767,58 @@ class Game:
             if (not b.is_dead and b.kingdom_id == self.player_kingdom_id)
         }
 
-        self.resource_manager.update(dt, self.tilemap, blocked_tiles=self._building_blocked_tiles)
+        with self.profiler.section("resource_ms"):
+            self.resource_manager.update(dt, self.tilemap, blocked_tiles=self._building_blocked_tiles)
         if not self.replay.is_playback:
-            self._update_ai_age_up(dt)
-            for ai in self.ai_controllers:
-                ai.update(dt)
-            self._update_chaos_factions(dt)
-        self._update_buildings(dt)
-        for ship in list(self.ships):
-            ship_events = ship.update(dt, tilemap=self.tilemap)
-            if ship_events:
-                self._process_ship_events(ship_events)
+            with self.profiler.section("ai_ms"):
+                self._update_ai_age_up(dt)
+                for ai in self.ai_controllers:
+                    ai.update(dt)
+                self._update_chaos_factions(dt)
+        with self.profiler.section("buildings_ms"):
+            self._update_buildings(dt)
+        with self.profiler.section("ships_ms"):
+            for ship in list(self.ships):
+                ship_events = ship.update(dt, tilemap=self.tilemap)
+                if ship_events:
+                    self._process_ship_events(ship_events)
 
         to_remove: list[Unit] = []
-        for unit in list(self.units):
-            event = unit.update(dt)
-            if event is not None:
-                kind = str(event.get("kind", ""))
-                if kind == "gather":
-                    node = event.get("node")
-                    amount = int(event.get("amount", 0))
-                    if node is not None and amount > 0:
-                        if unit.kingdom_id == self.player_kingdom_id and unit.can_gather:
-                            self._handle_worker_gather_event(unit, node, amount)
-                        elif unit.kingdom_id in self._ai_by_civ:
-                            self._ai_by_civ[unit.kingdom_id].handle_gather(node, amount)
-                        else:
-                            self.resource_manager.drain_node(node, amount)
-                elif kind == "build":
-                    b = event.get("building")
-                    work_seconds = float(event.get("work_seconds", 0.0))
-                    if isinstance(b, Building) and work_seconds > 0.0:
-                        completed = b.apply_construction_work(work_seconds)
-                        if completed:
-                            self._update_storage_capacity()
+        with self.profiler.section("units_ms"):
+            for unit in list(self.units):
+                event = unit.update(dt)
+                if event is not None:
+                    kind = str(event.get("kind", ""))
+                    if kind == "gather":
+                        node = event.get("node")
+                        amount = int(event.get("amount", 0))
+                        if node is not None and amount > 0:
+                            if unit.kingdom_id == self.player_kingdom_id and unit.can_gather:
+                                self._handle_worker_gather_event(unit, node, amount)
+                            elif unit.kingdom_id in self._ai_by_civ:
+                                self._ai_by_civ[unit.kingdom_id].handle_gather(node, amount)
+                            else:
+                                self.resource_manager.drain_node(node, amount)
+                    elif kind == "build":
+                        b = event.get("building")
+                        work_seconds = float(event.get("work_seconds", 0.0))
+                        if isinstance(b, Building) and work_seconds > 0.0:
+                            completed = b.apply_construction_work(work_seconds)
+                            if completed:
+                                self._update_storage_capacity()
 
-            if not self._is_chaos_civ(unit.asset_color):
-                unit.tick_hunger(dt * self._soldier_hunger_drain_mult)
-                if unit.needs_food:
-                    if self._kingdom_consume_food(unit.kingdom_id, 1):
-                        unit.feed()
+                if not self._is_chaos_civ(unit.asset_color):
+                    unit.tick_hunger(dt * self._soldier_hunger_drain_mult)
+                    if unit.needs_food:
+                        if self._kingdom_consume_food(unit.kingdom_id, 1):
+                            unit.feed()
 
-            if unit.death_finished:
-                to_remove.append(unit)
+                if unit.death_finished:
+                    to_remove.append(unit)
 
-        self._update_worker_haul()
-        self._deliver_ship_cargo_to_capitals()
+        with self.profiler.section("haul_ms"):
+            self._update_worker_haul()
+            self._deliver_ship_cargo_to_capitals()
 
         player_under_attack = False
         for unit in self.units:
@@ -3692,14 +3902,21 @@ class Game:
         if self._civ_sync_timer_s <= 0.0:
             self._civ_sync_timer_s = 0.35
             self._sync_civilizations()
+        self._diplomacy_tick_timer_s -= dt
+        if self._diplomacy_tick_timer_s <= 0.0:
+            self._diplomacy_tick_timer_s += DIPLOMACY_TICK_S
+            with self.profiler.section("diplomacy_ms"):
+                self._update_diplomacy(DIPLOMACY_TICK_S)
         self._political_tick_timer_s -= dt
         if self._political_tick_timer_s <= 0.0:
             self._political_tick_timer_s += POLITICAL_TICK_S
-            self._update_political_simulation(POLITICAL_TICK_S)
+            with self.profiler.section("politics_ms"):
+                self._update_political_simulation(POLITICAL_TICK_S)
         self._upkeep_tick_timer_s -= dt
         if self._upkeep_tick_timer_s <= 0.0:
             self._upkeep_tick_timer_s += UPKEEP_TICK_S
-            self._update_upkeep_and_loyalty(UPKEEP_TICK_S)
+            with self.profiler.section("upkeep_ms"):
+                self._update_upkeep_and_loyalty(UPKEEP_TICK_S)
         if self._network_enabled:
             self._reindex_units()
             self._reindex_ships()
@@ -3708,6 +3925,14 @@ class Game:
             if hero is not None:
                 self.camera.center_on_world(hero.world_pos.x, hero.world_pos.y)
         self._check_victory_defeat()
+        path_stats = self.pathfinder.consume_stats()
+        self.profiler.set_counter("path_calls", path_stats.get("calls", 0.0))
+        self.profiler.set_counter("path_expanded", path_stats.get("expanded", 0.0))
+        self.profiler.set_counter("path_failures", path_stats.get("failures", 0.0))
+        self.profiler.set_counter("path_ms", path_stats.get("time_ms", 0.0))
+        self.profiler.set_counter("unit_count", len(self.units))
+        self.profiler.set_counter("building_count", len(self.buildings))
+        self.profiler.set_counter("ship_count", len(self.ships))
 
     def _update_chaos_factions(self, dt: float) -> None:
         # Delay chaos raids so kingdoms can establish economy first.
@@ -3794,27 +4019,33 @@ class Game:
         vr0 = max(0, r0 - pad)
         vc1 = min(self.tilemap.cols - 1, c1 + pad)
         vr1 = min(self.tilemap.rows - 1, r1 + pad)
+        self.profiler.set_counter("visible_tile_count", max(0, (vc1 - vc0 + 1) * (vr1 - vr0 + 1)))
 
-        self.tilemap.draw(self.screen, self.camera)
-        self.tilemap.draw_trees(
-            self.screen,
-            self.camera,
-            self.tree_sets,
-            skip_tiles=self._tree_skip_tiles,
-        )
+        with self.profiler.section("tilemap_ms"):
+            self.tilemap.draw(self.screen, self.camera)
+            self.tilemap.draw_trees(
+                self.screen,
+                self.camera,
+                self.tree_sets,
+                skip_tiles=self._tree_skip_tiles,
+            )
 
-        self.resource_manager.draw_nodes(self.screen, self.camera)
+        with self.profiler.section("resource_draw_ms"):
+            self.resource_manager.draw_nodes(self.screen, self.camera)
 
+        entity_draw_count = 0
         for building in self.buildings:
             bc, br = self.tilemap.world_to_tile(building.world_pos.x, building.world_pos.y)
             if bc < vc0 or bc > vc1 or br < vr0 or br > vr1:
                 continue
             building.draw(self.screen, self.camera)
+            entity_draw_count += 1
         for ship in self.ships:
             sc, sr = self.tilemap.world_to_tile(ship.world_pos.x, ship.world_pos.y)
             if sc < vc0 or sc > vc1 or sr < vr0 or sr > vr1:
                 continue
             ship.draw(self.screen, self.camera)
+            entity_draw_count += 1
         self._draw_selected_node()
 
         if self.show_grid and self.camera.zoom >= 0.45:
@@ -3841,6 +4072,7 @@ class Game:
             if uc < vc0 or uc > vc1 or ur < vr0 or ur > vr1:
                 continue
             unit.draw(self.screen, self.camera)
+            entity_draw_count += 1
 
         pulse = 1.0 + 0.20 * math.sin(pygame.time.get_ticks() / 120.0)
         for unit in self._selected:
@@ -3904,17 +4136,21 @@ class Game:
             self._draw_build_palette()
             self._draw_building_ui()
         self.hud_ui.draw_resources(self.screen, self.resource_manager)
-        self.hud_ui.draw_minimap(
-            self.screen,
-            self.camera,
-            self.units,
-            self.buildings,
-            player_civilization=self.player_kingdom_id,
-            player_label=self._kingdom_display_name(self.player_kingdom_id),
-            color_resolver=self._entity_display_color,
-        )
+        with self.profiler.section("minimap_ms"):
+            self.hud_ui.draw_minimap(
+                self.screen,
+                self.camera,
+                self.units,
+                self.buildings,
+                player_civilization=self.player_kingdom_id,
+                player_label=self._kingdom_display_name(self.player_kingdom_id),
+                color_resolver=self._entity_display_color,
+            )
         if self.game_result is not None:
             self.hud_ui.draw_endgame(self.screen, self.game_result)
+        self.profiler.set_counter("entity_draw_count", entity_draw_count)
+        self.profiler.draw_overlay(self.screen)
+        self.profiler.draw_report(self.screen)
         pygame.display.flip()
 
     def _draw_build_preview(self) -> None:
@@ -3943,6 +4179,16 @@ class Game:
             pygame.draw.rect(self.screen, edge, tile_rect, 1)
 
     def _draw_hud(self) -> None:
+        def render_cached(font: pygame.font.Font, text: str, color: tuple[int, int, int]) -> pygame.Surface:
+            key = (id(font), text, tuple(color))
+            cached = self._hud_text_cache.get(key)
+            if cached is None:
+                cached = font.render(text, True, color)
+                if len(self._hud_text_cache) > 1200:
+                    self._hud_text_cache.clear()
+                self._hud_text_cache[key] = cached
+            return cached
+
         def fit_text(font: pygame.font.Font, text: str, max_w: int) -> str:
             if font.size(text)[0] <= max_w:
                 return text
@@ -3984,6 +4230,7 @@ class Game:
         form_label = self._formation_mode().upper()
         player_kingdom = self._kingdom(self.player_kingdom_id)
         capital = self._capital_for_kingdom(self.player_kingdom_id)
+        diplomacy_lines = self.diplomacy.ledger_lines(self, self.player_kingdom_id, limit=5)
 
         if self.ai_controllers:
             state_counts: dict[str, int] = {}
@@ -4042,14 +4289,14 @@ class Game:
         self.screen.blit(panel, (10, 8))
 
         title = "Komut HUD (Sabit)" if self._hud_pinned else "Komut HUD"
-        title_surf = self.font_md.render(title, True, (230, 236, 244))
+        title_surf = render_cached(self.font_md, title, (230, 236, 244))
         self.screen.blit(title_surf, (20, 16))
 
-        mode = self.font_xs.render("[F1] Sabitle/Sabiti Kaldir", True, (150, 186, 210))
+        mode = render_cached(self.font_xs, "[F1] Sabitle/Sabiti Kaldir", (150, 186, 210))
         self.screen.blit(mode, (20 + title_surf.get_width() + 10, 20))
 
         def draw_chip(x: int, y: int, text: str, color: tuple[int, int, int]) -> int:
-            surf = self.font_xs.render(text, True, color)
+            surf = render_cached(self.font_xs, text, color)
             w = surf.get_width() + 14
             h = surf.get_height() + 6
             chip = pygame.Surface((w, h), pygame.SRCALPHA)
@@ -4086,7 +4333,7 @@ class Game:
                 draw_chip(130, 84, f"Cag {age_label}", (232, 210, 142))
 
         if panel_h > 80:
-            ctx_surf = self.font_sm.render(fit_text(self.font_sm, context_line, panel_w - 26), True, context_color)
+            ctx_surf = render_cached(self.font_sm, fit_text(self.font_sm, context_line, panel_w - 26), context_color)
             self.screen.blit(ctx_surf, (20, 92))
 
         if show_full and panel_h > 130:
@@ -4095,20 +4342,30 @@ class Game:
                 cap_line = f"{capital_label}  Bskent HP {int(capital.hp)}/{capital.max_hp}"
             else:
                 cap_line = f"{capital_label}  Bskent kayip"
-            cap_surf = self.font_xs.render(fit_text(self.font_xs, cap_line, panel_w - 26), True, (232, 224, 172))
+            cap_surf = render_cached(self.font_xs, fit_text(self.font_xs, cap_line, panel_w - 26), (232, 224, 172))
             self.screen.blit(cap_surf, (20, 110))
             help_lines = [
                 "[TAB] Uretici Paneli  [B] Insa  [SagTik] Git/Topla/Saldir",
                 "[C] Hero Mod  [1/2/3/4/5] Topla  [Q/W/E/R] Uret  [U] Cikart",
-                "[F2/F3/F4] Stance  [F5] Formasyon  [H] Cag Atla  [F11] Tam Ekran",
+                "[F2/F3/F4] Stance  [F5] Formasyon  [F8/F9/F10] Profiler",
             ]
             for i, line in enumerate(help_lines):
-                help_surf = self.font_xs.render(
-                    fit_text(self.font_xs, line, panel_w - 26),
-                    True,
-                    (190, 212, 232),
-                )
+                help_surf = render_cached(self.font_xs, fit_text(self.font_xs, line, panel_w - 26), (190, 212, 232))
                 self.screen.blit(help_surf, (20, 122 + i * 12))
+        if show_full and diplomacy_lines:
+            ledger_x = panel_w + 24
+            ledger_y = 16
+            ledger_w = 310
+            ledger_h = 32 + len(diplomacy_lines) * 16
+            ledger = pygame.Surface((ledger_w, ledger_h), pygame.SRCALPHA)
+            pygame.draw.rect(ledger, (12, 18, 26, 180), ledger.get_rect(), border_radius=12)
+            pygame.draw.rect(ledger, (96, 130, 158, 228), ledger.get_rect(), 1, border_radius=12)
+            self.screen.blit(ledger, (ledger_x, ledger_y))
+            title2 = render_cached(self.font_md, "Krallik Defteri", (236, 240, 246))
+            self.screen.blit(title2, (ledger_x + 12, ledger_y + 8))
+            for idx, line in enumerate(diplomacy_lines[:5]):
+                ledger_surf = render_cached(self.font_xs, fit_text(self.font_xs, line, ledger_w - 20), (202, 216, 232))
+                self.screen.blit(ledger_surf, (ledger_x + 12, ledger_y + 28 + idx * 16))
 
         if tools_active:
             tx = 20

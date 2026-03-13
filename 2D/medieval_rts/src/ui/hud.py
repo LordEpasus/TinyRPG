@@ -39,6 +39,7 @@ class GameHUD:
         self._scaled_cache: dict[tuple[str, int, int], pygame.Surface] = {}
         self._icons = self._load_resource_icons()
         self._minimap_base = self._build_minimap_surface()
+        self._minimap_scaled_cache: dict[tuple[int, int], pygame.Surface] = {}
 
     def _load_skin(self) -> dict[str, pygame.Surface]:
         base = os.path.join(TINY_SWORDS, "UI Elements", "UI Elements")
@@ -224,8 +225,12 @@ class GameHUD:
         if self._minimap_base.get_size() == (map_w, map_h):
             mm = self._minimap_base
         else:
-            mm = pygame.transform.scale(self._minimap_base, (map_w, map_h))
-        screen.blit(mm, (px, py))
+            cache_key = (map_w, map_h)
+            mm = self._minimap_scaled_cache.get(cache_key)
+            if mm is None:
+                mm = pygame.transform.scale(self._minimap_base, (map_w, map_h))
+                self._minimap_scaled_cache[cache_key] = mm
+        work = mm.copy()
 
         def resolve_color(entity, fallback_key: str) -> tuple[int, int, int]:
             if callable(color_resolver):
@@ -247,7 +252,7 @@ class GameHUD:
             if not (px <= mx < px + map_w and py <= my < py + map_h):
                 continue
             color = resolve_color(b, getattr(b, "civilization", ""))
-            screen.set_at((mx, my), color)
+            work.set_at((mx - px, my - py), color)
 
         for u in units:
             if u.is_dead:
@@ -258,7 +263,8 @@ class GameHUD:
             if not (px <= mx < px + map_w and py <= my < py + map_h):
                 continue
             color = resolve_color(u, getattr(u, "civilization", ""))
-            screen.set_at((mx, my), color)
+            work.set_at((mx - px, my - py), color)
+        screen.blit(work, (px, py))
 
         # Camera viewport rectangle.
         c0, r0, c1, r1 = camera.get_visible_tile_range()

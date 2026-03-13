@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import time
 
 
 class Pathfinder:
@@ -23,6 +24,15 @@ class Pathfinder:
         self.cols = tilemap.cols
         self.rows = tilemap.rows
         self.walkable = getattr(tilemap, "walkable_map", None)
+        self._stats = {"calls": 0, "time_ms": 0.0, "failures": 0, "expanded": 0}
+
+    def reset_stats(self) -> None:
+        self._stats = {"calls": 0, "time_ms": 0.0, "failures": 0, "expanded": 0}
+
+    def consume_stats(self) -> dict[str, float]:
+        out = dict(self._stats)
+        self.reset_stats()
+        return out
 
     def find_path_world(
         self,
@@ -53,18 +63,27 @@ class Pathfinder:
         walkable_fn=None,
         max_expansions: int | None = None,
     ) -> list[tuple[int, int]]:
+        t0 = time.perf_counter()
+        self._stats["calls"] += 1
         blocked = blocked or set()
         if not self._in_bounds(start) or not self._in_bounds(goal):
+            self._stats["failures"] += 1
+            self._stats["time_ms"] += (time.perf_counter() - t0) * 1000.0
             return []
 
         goal = self._nearest_walkable(goal, blocked, walkable_fn, max_radius=26)
         if goal is None:
+            self._stats["failures"] += 1
+            self._stats["time_ms"] += (time.perf_counter() - t0) * 1000.0
             return []
 
         start = self._normalize_start(start, blocked, walkable_fn, max_radius=16)
         if start is None:
+            self._stats["failures"] += 1
+            self._stats["time_ms"] += (time.perf_counter() - t0) * 1000.0
             return []
         if start == goal:
+            self._stats["time_ms"] += (time.perf_counter() - t0) * 1000.0
             return [goal]
 
         if max_expansions is None:
@@ -90,8 +109,13 @@ class Pathfinder:
                 continue
             expanded += 1
             if expanded > max_expansions:
+                self._stats["expanded"] += expanded
+                self._stats["failures"] += 1
+                self._stats["time_ms"] += (time.perf_counter() - t0) * 1000.0
                 return []
             if current == goal:
+                self._stats["expanded"] += expanded
+                self._stats["time_ms"] += (time.perf_counter() - t0) * 1000.0
                 return self._reconstruct(came_from, current)
             closed.add(current)
 
@@ -119,6 +143,9 @@ class Pathfinder:
                 counter += 1
                 f = tentative + heur(nxt, goal)
                 heapq.heappush(open_heap, (f, counter, nxt))
+        self._stats["expanded"] += expanded
+        self._stats["failures"] += 1
+        self._stats["time_ms"] += (time.perf_counter() - t0) * 1000.0
         return []
 
     def _neighbors(

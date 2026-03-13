@@ -11,7 +11,7 @@ from typing import Any
 
 # ── Network settings ──────────────────────────────────────────────────────────
 PORT = 5555
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 # ── Message types ─────────────────────────────────────────────────────────────
 MSG_HELLO = "hello"
@@ -31,6 +31,11 @@ MSG_HERO_INPUT = "hero_input"
 MSG_FORMATION_SET = "formation_set"
 MSG_KINGDOM_SPLIT = "kingdom_split"
 MSG_CAPITAL_STOCK = "capital_stock_adjust"
+MSG_DIPLOMACY_STATE = "diplomacy_state"
+MSG_TREATY_CHANGE = "treaty_change"
+MSG_TRIBUTE_PAID = "tribute_paid"
+MSG_SUPPRESSION_ORDER = "suppression_order"
+MSG_NAVAL_TASK = "naval_task"
 MSG_TECH_START = "tech_start"
 MSG_TECH_AGE = "tech_age"
 MSG_DISCONNECT = "disconnect"

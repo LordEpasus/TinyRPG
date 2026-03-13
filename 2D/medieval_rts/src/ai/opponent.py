@@ -7,6 +7,7 @@ from settings import TILE_SIZE
 from src.entities.building import Building
 from src.entities.ship import Ship
 from src.entities.unit import Unit
+from src.systems.diplomacy import TreatyState
 
 if TYPE_CHECKING:
     from game import Game
@@ -21,6 +22,9 @@ class AIController:
     STATE_STABILIZE = "STABILIZE"
     STATE_NAVAL_LOGISTICS = "NAVAL"
     STATE_CIVIL_WAR_RESPONSE = "CIVIL_WAR"
+    STATE_SEEK_TRADE = "TRADE"
+    STATE_ENFORCE_TRIBUTE = "TRIBUTE"
+    STATE_FALLBACK_REBUILD = "REBUILD"
     _STATE_CYCLE = (STATE_EXPAND, STATE_GATHER, STATE_ATTACK)
     _STATE_DURATION = {
         STATE_EXPAND: 30.0,
@@ -90,6 +94,10 @@ class AIController:
         self._defense_hold_s = 0.0
         self._attack_target_refresh_s = 0.0
         self._attack_target = None
+        self._suppression_target = None
+        self._naval_target_kingdom = ""
+        self._path_cache: dict[tuple[tuple[int, int], tuple[int, int]], tuple[bool, float]] = {}
+        self._resource_cache: dict[str, tuple[object | None, float]] = {}
         self._rally_radius = TILE_SIZE * 6.5
         self._threat_radius = TILE_SIZE * 13.0
 
@@ -181,6 +189,12 @@ class AIController:
             self._run_naval_logistics()
         elif self.state == self.STATE_CIVIL_WAR_RESPONSE:
             self._run_civil_war_response()
+        elif self.state == self.STATE_SEEK_TRADE:
+            self._run_seek_trade()
+        elif self.state == self.STATE_ENFORCE_TRIBUTE:
+            self._run_enforce_tribute()
+        elif self.state == self.STATE_FALLBACK_REBUILD:
+            self._run_fallback_rebuild()
         else:
             self._run_attack()
 
@@ -235,12 +249,52 @@ class AIController:
             self._expand_timer_s = 2.4
             self._attempt_expand_buildings()
 
+    def _run_seek_trade(self) -> None:
+        self._run_stabilize()
+        if self._scan_timer_s <= 0.0:
+            self._scan_timer_s = 3.0
+            self._run_scan()
+
+    def _run_enforce_tribute(self) -> None:
+        self._run_stabilize()
+        if self._attack_order_timer_s <= 0.0:
+            self._attack_order_timer_s = 0.7
+            target = self._select_attack_objective()
+            if target is not None:
+                for unit in self._attack_group_units():
+                    unit.attack_command(
+                        target,
+                        pathfinder=self.game.pathfinder,
+                        blocked_tiles=self.game._building_blocked_tiles,
+                    )
+
+    def _run_fallback_rebuild(self) -> None:
+        self._run_stabilize()
+        if self._expand_timer_s <= 0.0:
+            self._expand_timer_s = 2.2
+            self._attempt_expand_buildings()
+
     def _run_civil_war_response(self) -> None:
         self._run_stabilize()
         threats = self._enemy_units_near_base()
         if threats:
             self._defense_hold_s = max(self._defense_hold_s, 4.0)
             self._run_defend()
+        rebel_id = self._rebel_target_id()
+        if rebel_id:
+            self._suppression_target = rebel_id
+            if self._attack_order_timer_s <= 0.0:
+                self._attack_order_timer_s = 0.72
+                if self.game._should_broadcast_kingdom_state(self.civilization):
+                    self.game._net_send(
+                        {
+                            "type": "suppression_order",
+                            "civ": self.asset_color,
+                            "kingdom_id": self.civilization,
+                            "target_kingdom_id": rebel_id,
+                        }
+                    )
+                self._issue_group_attack_on_kingdom(rebel_id, reserve_bias=2)
 
     def _run_naval_logistics(self) -> None:
         if self._expand_timer_s <= 0.0:
@@ -270,6 +324,8 @@ class AIController:
         food_days, gold_days = self._capital_stock_days(civ)
         reserve_ratio = self._reserve_ratio(civ)
         threat = self._threat_level_near_base()
+        dip = self.game.diplomacy.assess_kingdom(self.game, self.civilization)
+        war_targets = self.game.diplomacy.war_targets_for(self.civilization)
         scores = {
             self.STATE_EXPAND: 1.8,
             self.STATE_GATHER: 2.2,
@@ -277,6 +333,9 @@ class AIController:
             self.STATE_STABILIZE: 0.0,
             self.STATE_NAVAL_LOGISTICS: 0.0,
             self.STATE_CIVIL_WAR_RESPONSE: 0.0,
+            self.STATE_SEEK_TRADE: 0.0,
+            self.STATE_ENFORCE_TRIBUTE: 0.0,
+            self.STATE_FALLBACK_REBUILD: 0.0,
         }
 
         scores[self.STATE_GATHER] += max(0.0, 3.0 - min(food_days, gold_days)) * 0.55
@@ -294,13 +353,21 @@ class AIController:
             scores[self.STATE_STABILIZE] += (55.0 - civ.stability) * 0.08
         if civ.stability < 36.0 or civ.loyalty < 42.0:
             scores[self.STATE_CIVIL_WAR_RESPONSE] += 4.8 + max(0.0, 42.0 - civ.loyalty) * 0.05
+        if dip.suppress_rebels:
+            scores[self.STATE_CIVIL_WAR_RESPONSE] += 4.2 + max(0.0, dip.pressure) * 0.05
+        if dip.trade_partner and reserve_ratio < 1.12:
+            scores[self.STATE_SEEK_TRADE] += 3.1
+        if dip.tribute_target and reserve_ratio > 1.05:
+            scores[self.STATE_ENFORCE_TRIBUTE] += 2.4
+        if dip.capital_risk > 1.6 or self.game._capital_for_kingdom(self.civilization) is None:
+            scores[self.STATE_FALLBACK_REBUILD] += 4.0 + dip.capital_risk * 0.8
         if threat > 0:
             scores[self.STATE_STABILIZE] += threat * 0.35
             if reserve_ratio < 1.1:
                 scores[self.STATE_STABILIZE] += 0.8
-        if self._needs_naval_logistics():
+        if self._needs_naval_logistics() or dip.naval_required:
             scores[self.STATE_NAVAL_LOGISTICS] += 3.2 if reserve_ratio >= 0.92 else 1.1
-        if self._can_launch_attack():
+        if self._can_launch_attack() and war_targets:
             scores[self.STATE_ATTACK] += 2.8 + min(2.2, self._combat_count() * 0.18)
             if food_days >= 4.0 and gold_days >= 4.0:
                 scores[self.STATE_ATTACK] += 1.0
@@ -308,6 +375,8 @@ class AIController:
             scores[self.STATE_EXPAND] += 0.9
         if not self._docks() and self._needs_naval_logistics():
             scores[self.STATE_EXPAND] += 0.4
+        if not war_targets:
+            scores[self.STATE_ATTACK] -= 1.4
         scores[self._planned_state] = scores.get(self._planned_state, 0.0) + 0.3
 
         self._planned_state = max(scores.items(), key=lambda item: (item[1], item[0]))[0]
@@ -469,6 +538,8 @@ class AIController:
     def _can_launch_attack(self) -> bool:
         if self._elapsed_s < self._attack_unlock_s:
             return False
+        if not self.game.diplomacy.war_targets_for(self.civilization):
+            return False
         civ = self.game._kingdom(self.civilization)
         food_days, gold_days = self._capital_stock_days(civ)
         reserve_ratio = self._reserve_ratio(civ)
@@ -570,11 +641,14 @@ class AIController:
         return [ship for ship in self.game.ships if ship.kingdom_id == self.civilization]
 
     def _nearest_enemy_castle(self) -> Building | None:
+        war_targets = set(self.game.diplomacy.war_targets_for(self.civilization))
+        if not war_targets:
+            return None
         castles = [
             b
             for b in self.game.buildings
             if (
-                b.kingdom_id != self.civilization
+                b.kingdom_id in war_targets
                 and not b.is_dead
                 and b.is_complete
                 and b.building_type == Building.TYPE_CASTLE
@@ -588,12 +662,21 @@ class AIController:
         )
 
     def _path_exists(self, start: tuple[float, float], target: tuple[float, float]) -> bool:
+        sc = self.game.tilemap.world_to_tile(start[0], start[1])
+        tc = self.game.tilemap.world_to_tile(target[0], target[1])
+        key = (sc, tc)
+        cached = self._path_cache.get(key)
+        if cached is not None and self._elapsed_s - cached[1] < 6.0:
+            return cached[0]
         points = self.game.pathfinder.find_path_world(
             start,
             target,
             blocked=self.game._building_blocked_tiles,
+            max_expansions=5200,
         )
-        return bool(points)
+        result = bool(points)
+        self._path_cache[key] = (result, self._elapsed_s)
+        return result
 
     def _resource_candidates(self, resource_type: str, *, limit: int = 10) -> list[ResourceNode]:
         nodes = [
@@ -605,13 +688,21 @@ class AIController:
         return nodes[:limit]
 
     def _remote_resource_node(self, resource_type: str) -> ResourceNode | None:
+        cached = self._resource_cache.get(resource_type)
+        if cached is not None and self._elapsed_s - cached[1] < 4.0:
+            node = cached[0]
+            if node is None or getattr(node, "is_depleted", False):
+                return None
+            return node
         origin = self._capital_world()
         for node in self._resource_candidates(resource_type):
             if self._path_exists(origin, (node.wx, node.wy)):
                 continue
             if self.game._nearest_water_world(node.wx, node.wy, max_radius=8) is None:
                 continue
+            self._resource_cache[resource_type] = (node, self._elapsed_s)
             return node
+        self._resource_cache[resource_type] = (None, self._elapsed_s)
         return None
 
     def _needs_naval_logistics(self) -> bool:
@@ -620,6 +711,61 @@ class AIController:
         if target_castle is not None and not self._path_exists(origin, (target_castle.world_pos.x, target_castle.world_pos.y)):
             return True
         return self._remote_resource_node(self._preferred_resource_type()) is not None
+
+    def _rebel_target_id(self) -> str:
+        assessment = self.game.diplomacy.assess_kingdom(self.game, self.civilization)
+        return assessment.rebel_target
+
+    def _tribute_target_id(self) -> str:
+        assessment = self.game.diplomacy.assess_kingdom(self.game, self.civilization)
+        return assessment.tribute_target
+
+    def _issue_group_attack_on_kingdom(self, kingdom_id: str, *, reserve_bias: int = 0) -> None:
+        target = self._target_object_for_kingdom(kingdom_id)
+        if target is None:
+            return
+        attackers = self._attack_group_units()
+        if reserve_bias > 0 and len(attackers) > reserve_bias + 2:
+            attackers = attackers[:-reserve_bias]
+        for unit in attackers:
+            unit.attack_command(
+                target,
+                pathfinder=self.game.pathfinder,
+                blocked_tiles=self.game._building_blocked_tiles,
+            )
+
+    def _target_object_for_kingdom(self, kingdom_id: str):
+        enemy_buildings = [
+            b
+            for b in self.game.buildings
+            if b.kingdom_id == kingdom_id and not b.is_dead and not b.under_construction
+        ]
+        high_value = [
+            b
+            for b in enemy_buildings
+            if b.building_type in (Building.TYPE_CASTLE, Building.TYPE_BARRACKS, Building.TYPE_ARCHERY)
+        ]
+        if high_value:
+            return min(
+                high_value,
+                key=lambda b: (b.world_pos.x - self._rally_world[0]) ** 2 + (b.world_pos.y - self._rally_world[1]) ** 2,
+            )
+        enemy_units = [
+            u
+            for u in self.game.units
+            if u.kingdom_id == kingdom_id and not u.is_dead and u.can_attack
+        ]
+        if enemy_units:
+            return min(
+                enemy_units,
+                key=lambda u: (u.world_pos.x - self._rally_world[0]) ** 2 + (u.world_pos.y - self._rally_world[1]) ** 2,
+            )
+        if enemy_buildings:
+            return min(
+                enemy_buildings,
+                key=lambda b: (b.world_pos.x - self._rally_world[0]) ** 2 + (b.world_pos.y - self._rally_world[1]) ** 2,
+            )
+        return None
 
     def _run_resource_shipping(self, node: ResourceNode) -> None:
         docks = self._docks()
@@ -685,7 +831,11 @@ class AIController:
                 )
 
     def _run_naval_invasion(self) -> None:
-        target = self._nearest_enemy_castle()
+        assessment = self.game.diplomacy.assess_kingdom(self.game, self.civilization)
+        target_id = assessment.best_enemy or self._rebel_target_id()
+        if not target_id:
+            return
+        target = self._target_object_for_kingdom(target_id)
         if target is None:
             return
         home_anchor = self._capital_world()
@@ -699,44 +849,60 @@ class AIController:
         target_water = self.game._nearest_water_world(target.world_pos.x, target.world_pos.y, max_radius=8)
         if home_water is None or target_water is None:
             return
-        ship = min(
+        attack_group = sorted(
+            self._attack_group_units(),
+            key=lambda u: (u.world_pos.x - home_anchor[0]) ** 2 + (u.world_pos.y - home_anchor[1]) ** 2,
+        )
+        ships = sorted(
             ships,
             key=lambda s: (s.world_pos.x - home_water[0]) ** 2 + (s.world_pos.y - home_water[1]) ** 2,
         )
-        if ship.passenger_count > 0 and not ship._boarding_queue:
-            ship.move_to(
-                target_water[0],
-                target_water[1],
-                pathfinder=self.game.pathfinder,
-                blocked_tiles=self.game._building_blocked_tiles,
-            )
-            ship.request_unload(target.world_pos.x, target.world_pos.y)
-            return
-        if ship.passenger_count == 0 and not ship._boarding_queue:
-            if (ship.world_pos.x - home_water[0]) ** 2 + (ship.world_pos.y - home_water[1]) ** 2 > (TILE_SIZE * 2.4) ** 2:
+        self._naval_target_kingdom = target_id
+        for idx, ship in enumerate(ships[:2]):
+            if ship.passenger_count > 0 and not ship._boarding_queue:
                 ship.move_to(
-                    home_water[0],
-                    home_water[1],
+                    target_water[0],
+                    target_water[1],
                     pathfinder=self.game.pathfinder,
                     blocked_tiles=self.game._building_blocked_tiles,
                 )
-                return
-            attackers = sorted(
-                self._attack_group_units(),
-                key=lambda u: (u.world_pos.x - home_anchor[0]) ** 2 + (u.world_pos.y - home_anchor[1]) ** 2,
-            )[: Ship.CAPACITY]
-            for attacker in attackers:
-                ship.request_board(
-                    attacker,
-                    pathfinder=self.game.pathfinder,
-                    blocked_tiles=self.game._building_blocked_tiles,
-                )
+                ship.request_unload(target.world_pos.x, target.world_pos.y)
+                continue
+            if ship.passenger_count == 0 and not ship._boarding_queue:
+                if (ship.world_pos.x - home_water[0]) ** 2 + (ship.world_pos.y - home_water[1]) ** 2 > (TILE_SIZE * 2.4) ** 2:
+                    ship.move_to(
+                        home_water[0],
+                        home_water[1],
+                        pathfinder=self.game.pathfinder,
+                        blocked_tiles=self.game._building_blocked_tiles,
+                    )
+                    continue
+                batch = attack_group[idx * Ship.CAPACITY : (idx + 1) * Ship.CAPACITY]
+                for attacker in batch:
+                    ship.request_board(
+                        attacker,
+                        pathfinder=self.game.pathfinder,
+                        blocked_tiles=self.game._building_blocked_tiles,
+                    )
+        if self.game._should_broadcast_kingdom_state(self.civilization):
+            self.game._net_send(
+                {
+                    "type": "naval_task",
+                    "civ": self.asset_color,
+                    "kingdom_id": self.civilization,
+                    "target_kingdom_id": target_id,
+                    "task": "launch_naval_invasion",
+                }
+            )
 
     def _enemy_units_near_base(self) -> list[Unit]:
         radius2 = self._threat_radius * self._threat_radius
         out: list[Unit] = []
+        war_targets = set(self.game.diplomacy.war_targets_for(self.civilization))
         for unit in self.game.units:
             if unit.is_dead or unit.kingdom_id == self.civilization:
+                continue
+            if not unit.asset_color.startswith(("Orc", "Slime")) and unit.kingdom_id not in war_targets:
                 continue
             d2 = (unit.world_pos.x - self._base_world[0]) ** 2 + (unit.world_pos.y - self._base_world[1]) ** 2
             if d2 <= radius2:
@@ -751,24 +917,41 @@ class AIController:
         return score
 
     def _select_attack_objective(self):
+        war_targets = set(self.game.diplomacy.war_targets_for(self.civilization))
         if self._attack_target is not None and self._attack_target_refresh_s > 0.0:
             if isinstance(self._attack_target, Unit):
-                if not self._attack_target.is_dead and self._attack_target.kingdom_id != self.civilization:
+                if (
+                    not self._attack_target.is_dead
+                    and self._attack_target.kingdom_id != self.civilization
+                    and self._attack_target.kingdom_id in war_targets
+                ):
                     return self._attack_target
             elif isinstance(self._attack_target, Building):
-                if not self._attack_target.is_dead and self._attack_target.kingdom_id != self.civilization:
+                if (
+                    not self._attack_target.is_dead
+                    and self._attack_target.kingdom_id != self.civilization
+                    and self._attack_target.kingdom_id in war_targets
+                ):
                     return self._attack_target
 
         self._attack_target_refresh_s = 2.8
+        if not war_targets:
+            tribute_target = self._tribute_target_id()
+            if tribute_target:
+                war_targets.add(tribute_target)
+        if not war_targets:
+            rebel_target = self._rebel_target_id()
+            if rebel_target:
+                war_targets.add(rebel_target)
         enemy_units = [
             u
             for u in self.game.units
-            if u.kingdom_id != self.civilization and not u.is_dead
+            if u.kingdom_id in war_targets and not u.is_dead
         ]
         enemy_buildings = [
             b
             for b in self.game.buildings
-            if b.kingdom_id != self.civilization and not b.is_dead and not b.under_construction
+            if b.kingdom_id in war_targets and not b.is_dead and not b.under_construction
         ]
 
         # Priority: player combat units near front -> production buildings -> castles -> any enemy unit.

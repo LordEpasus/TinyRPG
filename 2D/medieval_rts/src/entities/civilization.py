@@ -31,6 +31,14 @@ class Civilization:
     is_major: bool = True
     crest: str = ""
     display_color: tuple[int, int, int] = (200, 200, 200)
+    relations: dict[str, str] = field(default_factory=dict)
+    war_exhaustion: float = 0.0
+    tribute_balance: float = 0.0
+    suppression_priority: float = 0.0
+    naval_intent: float = 0.0
+    stance_bias: str = "steady"
+    capital_risk: float = 0.0
+    diplomatic_memory: dict[str, float] = field(default_factory=dict)
     units: list["Unit"] = field(default_factory=list)
     buildings: list["Building"] = field(default_factory=list)
 
@@ -58,6 +66,8 @@ class Civilization:
         self.units = [u for u in self.units if not getattr(u, "is_dead", False)]
         self.buildings = [b for b in self.buildings if not getattr(b, "is_dead", False)]
         self.split_cooldown = max(0.0, float(self.split_cooldown))
+        self.war_exhaustion = max(0.0, float(self.war_exhaustion))
+        self.capital_risk = max(0.0, float(self.capital_risk))
 
     def can_afford(self, costs: dict[str, int]) -> bool:
         for key, amount in costs.items():
